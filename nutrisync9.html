@@ -1,0 +1,1810 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="Nutrition Hub"/>
+  <meta name="theme-color" content="#0f0f0f"/>
+  <title>Nutrition Hub</title>
+  <link href="https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+    html,body{height:100%;background:#0f0f0f;overflow:hidden}
+    #root{height:100%;overflow-y:auto;-webkit-overflow-scrolling:touch}
+    ::-webkit-scrollbar{width:0;height:0}
+    input,select,button{font-family:'Sora',sans-serif;-webkit-appearance:none;appearance:none}
+    input:focus,select:focus{outline:none}
+    .tap{transition:all 0.15s;cursor:pointer}.tap:active{transform:scale(0.95);opacity:0.85}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+<script type="text/babel">
+const { useState, useEffect } = React;
+// ─── STORAGE ──────────────────────────────────────────────────────────────────
+const SK = {
+  FOODS:"napp_foods", RECIPES:"napp_recipes",
+  STORES:"napp_stores",
+  PLANS:"napp_meal_plans",
+  WEEK_PLAN:"napp_week_plan",
+  MANUAL_ITEMS:"napp_shopping_manual",
+};
+const load=(key,fb)=>{try{const v=localStorage.getItem(key);return v?JSON.parse(v):fb;}catch{return fb;}};
+const save=(key,val)=>{try{localStorage.setItem(key,JSON.stringify(val));}catch{}};
+
+// ─── DEFAULTS ─────────────────────────────────────────────────────────────────
+const DEFAULT_STORES=[
+  {id:"s1",name:"Eurospin",   cats:["Frutta","Verdura","Alimenti","Banco Frigo","Banco Surgelati","Macelleria","Pescheria","Detersivi","Cura della persona"]},
+  {id:"s2",name:"Martinelli", cats:["Frutta","Verdura","Alimenti","Banco Frigo","Banco Surgelati","Macelleria","Pescheria","Detersivi","Cura della persona"]},
+  {id:"s3",name:"Macelleria", cats:["Carne","Alimenti"]},
+  {id:"s4",name:"NaturaSì",   cats:["Alimenti","Detersivi"]},
+];
+const SLOTS=[
+  {id:"colazione",           label:"Colazione",           icon:"☀️"},
+  {id:"spuntino_mattina",    label:"Spuntino mattina",    icon:"🍎"},
+  {id:"pranzo",              label:"Pranzo",              icon:"🍽️"},
+  {id:"spuntino_pomeriggio", label:"Spuntino pomeriggio", icon:"🥜"},
+  {id:"cena",                label:"Cena",                icon:"🌙"},
+];
+const DAYS_IT=["Lun","Mar","Mer","Gio","Ven","Sab","Dom"];
+const STORE_COLORS=["#a8e6cf","#82b4ff","#ffb347","#ff87ab","#c3a8ff","#ffd6a5"];
+
+// ─── CALC ─────────────────────────────────────────────────────────────────────
+function macrosFromGrams(food,grams){
+  const f=grams/100;
+  return{kcal:Math.round(food.kcal*f),p:Math.round(food.p*f*10)/10,g:Math.round(food.g*f*10)/10,c:Math.round(food.c*f*10)/10};
+}
+
+// ─── MIGRATION ────────────────────────────────────────────────────────────────
+// Backup in memoria dei dati originali prima della migrazione (solo runtime)
+let _preMigrationBackup = null;
+
+function isNewSlotFormat(slot){
+  // Nuovo formato: oggetto con almeno una di queste chiavi
+  return slot!==null && typeof slot==="object" && !Array.isArray(slot) &&
+    ("comune" in slot || "giusy" in slot || "davide" in slot);
+}
+
+function migrateSlot(slot){
+  // Idempotente: se già nel nuovo formato, ritorna invariato
+  if(isNewSlotFormat(slot)) return slot;
+  // Vecchio formato: array di ingredienti → tutto va in "comune"
+  if(Array.isArray(slot)) return {comune:[...slot], giusy:[], davide:[]};
+  // Caso anomalo (null, undefined, altro): slot vuoto
+  return {comune:[], giusy:[], davide:[]};
+}
+
+function migratePlans(plans){
+  if(!Array.isArray(plans)) return [];
+
+  // Controlla se c'è qualcosa da migrare (slot format O comune items)
+  const needsMigration=plans.some(plan=>
+    Object.values(plan.slots||{}).some(slot=>{
+      if(!isNewSlotFormat(slot)) return true; // slot vecchio formato array
+      // slot nuovo formato: controlla se qualche item comune ha ancora solo grams
+      return (slot.comune||[]).some(item=>item.gramsG===undefined);
+    })
+  );
+
+  if(!needsMigration) return plans; // idempotente
+
+  // Salva backup in memoria (una sola volta)
+  if(!_preMigrationBackup){
+    _preMigrationBackup=JSON.parse(JSON.stringify(plans));
+    console.log(`[NutritionHub] Pre-migration backup creato: ${plans.length} piani`);
+  }
+
+  let migrated=0;
+  const result=plans.map(plan=>{
+    const newSlots={};
+    let planMigrated=false;
+    Object.entries(plan.slots||{}).forEach(([slotId,slot])=>{
+      if(!isNewSlotFormat(slot)){
+        // Migrazione slot vecchio formato (array) → {comune, giusy, davide}
+        newSlots[slotId]=migrateSlot(slot);
+        planMigrated=true;
+      } else {
+        // Slot già nel nuovo formato — migra gli item comuni grams→gramsG/gramsD
+        const migratedComune=(slot.comune||[]).map(item=>{
+          if(item.gramsG!==undefined) return item; // già migrato
+          const g=item.grams??100;
+          return{...item, gramsG:g, gramsD:g};
+        });
+        const comuneChanged=migratedComune.some((item,i)=>item.gramsG!==undefined&&(slot.comune||[])[i].gramsG===undefined);
+        if(comuneChanged){
+          newSlots[slotId]={...slot, comune:migratedComune};
+          planMigrated=true;
+        } else {
+          newSlots[slotId]=slot;
+        }
+      }
+    });
+    if(planMigrated) migrated++;
+    return planMigrated?{...plan,slots:newSlots}:plan;
+  });
+
+  console.log(`[NutritionHub] Migrazione completata: ${migrated}/${plans.length} piani aggiornati`);
+  return result;
+}
+
+
+function getWeekDates(offset=0){
+  const today=new Date(),mon=new Date(today);
+  mon.setDate(today.getDate()-((today.getDay()+6)%7)+offset*7);
+  return Array.from({length:7},(_,i)=>{const d=new Date(mon);d.setDate(mon.getDate()+i);return d.toISOString().split("T")[0];});
+}
+function fmtDate(iso){const[,m,d]=iso.split("-");return `${d}/${m}`;}
+function fmtDateFull(iso){const[y,m,d]=iso.split("-");return `${d}/${m}/${y}`;}
+function todayISO(){return new Date().toISOString().split("T")[0];}
+
+// ─── MICRO UI ─────────────────────────────────────────────────────────────────
+function ModalOverlay({children,onClose}){
+  return(
+    <div style={{position:"fixed",inset:0,background:"#000b",zIndex:200,display:"flex",alignItems:"flex-end",justifyContent:"center"}}
+      onClick={e=>{if(e.target===e.currentTarget)onClose();}}>
+      <div style={{background:"#141414",borderRadius:"20px 20px 0 0",width:"100%",maxWidth:480,maxHeight:"88vh",overflowY:"auto",border:"1px solid #252525",borderBottom:"none"}}>
+        <div style={{display:"flex",justifyContent:"flex-end",padding:"12px 16px 0"}}>
+          <button onClick={onClose} style={{background:"#252525",border:"none",color:"#888",borderRadius:8,width:28,height:28,fontSize:16,cursor:"pointer"}}>×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ─── MAIN APP ─────────────────────────────────────────────────────────────────
+function NutritionApp(){
+  const [foods,setFoods]          =useState(()=>load(SK.FOODS,[]));
+  const [recipes,setRecipes]      =useState(()=>load(SK.RECIPES,[]));
+  const [stores,setStores]        =useState(()=>load(SK.STORES,DEFAULT_STORES));
+  const [mealPlans,setMealPlans]  =useState(()=>migratePlans(load(SK.PLANS,[])));
+  const [weekPlan,setWeekPlan]    =useState(()=>load(SK.WEEK_PLAN,{}));
+  const [manualItems,setManualItems]=useState(()=>load(SK.MANUAL_ITEMS,[]));
+  const [tab,setTab]                   =useState("week");
+  const [selectedDate,setSelectedDate] =useState(todayISO());
+  const [weekOffset,setWeekOffset]     =useState(0);
+
+  useEffect(()=>{save(SK.FOODS,foods);},[foods]);
+  useEffect(()=>{save(SK.RECIPES,recipes);},[recipes]);
+  useEffect(()=>{save(SK.STORES,stores);},[stores]);
+  useEffect(()=>{save(SK.PLANS,mealPlans);},[mealPlans]);
+  useEffect(()=>{save(SK.WEEK_PLAN,weekPlan);},[weekPlan]);
+  useEffect(()=>{save(SK.MANUAL_ITEMS,manualItems);},[manualItems]);
+
+  const weekDates=getWeekDates(weekOffset);
+  const getFoodOrRecipe=id=>foods.find(f=>f.id===id)||recipes.find(r=>r.id===id);
+
+  const buildShoppingListFromPlans=(dates)=>{
+    const map={};
+    const addItems=(items,getGrams)=>{
+      if(!Array.isArray(items)) return;
+      items.forEach(item=>{
+        const food=getFoodOrRecipe(item.foodId);if(!food) return;
+        const g=getGrams(item);
+        if(!map[item.foodId]) map[item.foodId]={item:food,total:0};
+        map[item.foodId].total+=g;
+      });
+    };
+    dates.forEach(date=>{
+      const dayPlan=weekPlan[date]||{};
+      const planIds=typeof dayPlan==="object"&&!Array.isArray(dayPlan)
+        ?Object.values(dayPlan).filter(Boolean)
+        :(dayPlan?[dayPlan]:[]);
+      const uniqueIds=[...new Set(planIds)];
+      uniqueIds.forEach(planId=>{
+        const plan=mealPlans.find(p=>p.id===planId);if(!plan) return;
+        Object.values(plan.slots||{}).forEach(slot=>{
+          if(isNewSlotFormat(slot)){
+            // Comune: somma gramsG + gramsD (con fallback a grams)
+            addItems(slot.comune, i=>(i.gramsG??i.grams??0)+(i.gramsD??i.grams??0));
+            // Giusy e Davide: solo grams
+            addItems(slot.giusy,  i=>i.grams??0);
+            addItems(slot.davide, i=>i.grams??0);
+          } else {
+            addItems(slot, i=>i.grams??0);
+          }
+        });
+      });
+    });
+    return Object.values(map);
+  };
+
+  const resetAll=()=>{
+    if(!window.confirm("Eliminare tutti i dati?")) return;
+    Object.values(SK).forEach(k=>localStorage.removeItem(k));
+    setFoods([]);setRecipes([]);setStores(DEFAULT_STORES);
+    setMealPlans([]);setWeekPlan({});setManualItems([]);
+  };
+
+  const applyImport=(data)=>{
+    if(data.foods)    setFoods(data.foods);
+    if(data.recipes)  setRecipes(data.recipes);
+    if(data.stores)   setStores(data.stores);
+    if(data.plans)    setMealPlans(migratePlans(data.plans));
+    if(data.weekPlan) setWeekPlan(data.weekPlan);
+    setManualItems(data.manualItems||[]);
+  };
+
+  const assignPlanToDay=(date,planId)=>setWeekPlan(p=>({...p,[date]:planId}));
+  const removePlanFromDay=(date)=>setWeekPlan(p=>{const n={...p};delete n[date];return n;});
+
+  const MESI_IT=["Gennaio","Febbraio","Marzo","Aprile","Maggio","Giugno","Luglio","Agosto","Settembre","Ottobre","Novembre","Dicembre"];
+  const weekMonthLabel=(()=>{
+    const d0=new Date(weekDates[0]),d6=new Date(weekDates[6]);
+    const m0=d0.getMonth(),m6=d6.getMonth(),y0=d0.getFullYear(),y6=d6.getFullYear();
+    if(m0===m6) return `${MESI_IT[m0]} ${y6}`;
+    if(y0!==y6) return `${MESI_IT[m0]} ${y0} / ${MESI_IT[m6]} ${y6}`;
+    return `${MESI_IT[m0]} / ${MESI_IT[m6]} ${y6}`;
+  })();
+
+  const tabLabel={week:"Settimana",day:fmtDateFull(selectedDate),foods:"Alimenti",plans:"Piani",shopping:"Lista Spesa",settings:"Impostazioni"};
+
+  return(
+    <div style={{minHeight:"100vh",background:"#0f0f0f",color:"#e8e8e8",fontFamily:"'Sora',sans-serif",maxWidth:480,margin:"0 auto",paddingBottom:90}}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@400;500&display=swap');
+        *{box-sizing:border-box} ::-webkit-scrollbar{width:0;height:0}
+        input,select,button{font-family:'Sora',sans-serif;-webkit-appearance:none}
+        .tap{transition:all 0.15s;cursor:pointer} .tap:active{transform:scale(0.95)}
+        input:focus,select:focus{outline:none;border-color:#a8e6cf!important}
+      `}</style>
+
+      <div style={{padding:"env(safe-area-inset-top,20px) 18px 10px",paddingTop:"max(20px,env(safe-area-inset-top))",borderBottom:"1px solid #1a1a1a",position:"sticky",top:0,background:"#0f0f0f",zIndex:10}}>
+        <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+          <div>
+            <div style={{fontSize:9,letterSpacing:3,color:"#444",fontFamily:"'DM Mono',monospace",textTransform:"uppercase"}}>Nutrition Hub</div>
+            <div style={{fontSize:20,fontWeight:700,lineHeight:1.2,marginTop:1}}>{tabLabel[tab]}</div>
+            {tab==="week"&&<div style={{fontSize:11,color:"#555",marginTop:2,fontFamily:"'DM Mono',monospace"}}>{weekMonthLabel}</div>}
+          </div>
+          {tab==="week"&&(
+            <div style={{display:"flex",gap:6,alignItems:"center"}}>
+              <button onClick={()=>setWeekOffset(o=>o-1)} style={{background:"#161616",border:"none",color:"#555",borderRadius:9,width:30,height:30,fontSize:16,cursor:"pointer"}}>&#8249;</button>
+              <button onClick={()=>setWeekOffset(0)} style={{background:"#161616",border:"none",color:weekOffset===0?"#a8e6cf":"#555",borderRadius:9,padding:"0 10px",height:30,fontSize:11,cursor:"pointer"}}>Oggi</button>
+              <button onClick={()=>setWeekOffset(o=>o+1)} style={{background:"#161616",border:"none",color:"#555",borderRadius:9,width:30,height:30,fontSize:16,cursor:"pointer"}}>&#8250;</button>
+            </div>
+          )}
+          {tab==="day"&&(
+            <button onClick={()=>setTab("week")} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:8,padding:"6px 12px",fontSize:12,cursor:"pointer"}}>← Settimana</button>
+          )}
+        </div>
+      </div>
+
+      <div style={{padding:"14px 14px 0"}}>
+        {tab==="week"&&<WeekView {...{weekDates,getFoodOrRecipe,setSelectedDate,setTab,weekPlan,mealPlans,assignPlanToDay,removePlanFromDay}}/>}
+        {tab==="day"&&<DayView {...{selectedDate,weekPlan,mealPlans,getFoodOrRecipe}}/>}
+        {tab==="foods"&&<FoodsView {...{foods,setFoods,recipes,setRecipes,stores}}/>}
+        {tab==="plans"&&<PlansView {...{mealPlans,setMealPlans,foods,recipes}}/>}
+        {tab==="shopping"&&<ShoppingView {...{weekDates,buildShoppingListFromPlans,weekPlan,mealPlans,stores,setStores,manualItems,setManualItems}}/>}
+        {tab==="settings"&&<SettingsView {...{stores,setStores,foods,setFoods,resetAll,applyImport}}/>}
+      </div>
+
+      <div style={{position:"fixed",bottom:0,left:"50%",transform:"translateX(-50%)",width:"100%",maxWidth:480,
+        background:"#0f0f0f",borderTop:"1px solid #1a1a1a",display:"flex",
+        paddingTop:7,paddingBottom:"max(14px,env(safe-area-inset-bottom))"}}>
+        {[{id:"week",icon:"🗓️",label:"Settimana"},{id:"foods",icon:"🥩",label:"Alimenti"},{id:"plans",icon:"📋",label:"Piani"},{id:"shopping",icon:"🛒",label:"Spesa"},{id:"settings",icon:"⚙️",label:"Impostazioni"}].map(n=>(
+          <button key={n.id} className="tap" onClick={()=>setTab(n.id)}
+            style={{flex:1,background:"none",border:"none",color:tab===n.id||( tab==="day"&&n.id==="week")?"#a8e6cf":"#404040",
+              fontSize:9,display:"flex",flexDirection:"column",alignItems:"center",gap:2,padding:"3px 0",cursor:"pointer"}}>
+            <span style={{fontSize:19}}>{n.icon}</span>
+            <span style={{fontWeight:tab===n.id?700:400,letterSpacing:0.3}}>{n.label}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── DAY VIEW ─────────────────────────────────────────────────────────────────
+function DayView({selectedDate,weekPlan,mealPlans,getFoodOrRecipe}){
+  // Legge entrambi i formati: stringa diretta o {giusy, davide} legacy
+  const raw=weekPlan[selectedDate];
+  const getPlanId=()=>{
+    if(!raw) return null;
+    if(typeof raw==="string") return raw;
+    // Formato legacy {giusy, davide}: usa giusy se disponibile, altrimenti davide
+    if(typeof raw==="object") return raw.giusy||raw.davide||null;
+    return null;
+  };
+  const plan=mealPlans.find(p=>p.id===getPlanId())||null;
+
+  const calcTotals=(plan,who)=>{
+    let kc=0,pt=0,gr=0,ca=0;
+    Object.values(plan.slots||{}).forEach(slot=>{
+      if(isNewSlotFormat(slot)){
+        (slot.comune||[]).forEach(item=>{
+          const g=who==="giusy"?(item.gramsG??item.grams??0):(item.gramsD??item.grams??0);
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,g);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+        (slot[who]||[]).forEach(item=>{
+          const g=item.grams??0;
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,g);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+      } else {
+        (Array.isArray(slot)?slot:[]).forEach(item=>{
+          const g=item.grams??0;
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,g);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+      }
+    });
+    return{kcal:Math.round(kc),p:Math.round(pt*10)/10,g:Math.round(gr*10)/10,c:Math.round(ca*10)/10};
+  };
+
+  if(!plan) return(
+    <div style={{textAlign:"center",color:"#333",padding:"60px 0",fontSize:13}}>
+      <div style={{fontSize:42,marginBottom:12}}>📋</div>
+      <div style={{color:"#555",marginBottom:4}}>Nessun piano assegnato per questo giorno.</div>
+      <div style={{color:"#2a2a2a",fontSize:11}}>Assegna un piano dalla tab 🗓️</div>
+    </div>
+  );
+
+  const PersonPlan=({who,label,color})=>{
+    const tot=calcTotals(plan,who);
+    return(
+      <div style={{marginBottom:16}}>
+        <div style={{background:"#161616",borderRadius:13,padding:"11px 14px",marginBottom:8,border:`1px solid ${color}33`,display:"flex",alignItems:"center",gap:10}}>
+          <div style={{width:8,height:8,borderRadius:"50%",background:color,flexShrink:0}}/>
+          <div style={{flex:1}}>
+            <div style={{fontSize:10,color:"#555",fontWeight:600,letterSpacing:1,textTransform:"uppercase",marginBottom:1}}>{label}</div>
+            <div style={{fontWeight:700,fontSize:14,color:"#e8e8e8"}}>{plan.name}</div>
+          </div>
+        </div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5,marginBottom:8}}>
+          {[["kcal",tot.kcal,""],["P",tot.p,"g"],["G",tot.g,"g"],["C",tot.c,"g"]].map(([lbl,val,unit])=>(
+            <div key={lbl} style={{background:"#161616",borderRadius:9,padding:"8px 5px",textAlign:"center",border:"1px solid #1e1e1e"}}>
+              <div style={{fontSize:13,fontWeight:700,color,fontFamily:"'DM Mono',monospace"}}>{val}{unit}</div>
+              <div style={{fontSize:8,color:"#444",marginTop:2}}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+        {SLOTS.map(slot=>{
+          const slotData=plan.slots[slot.id];
+          if(!slotData) return null;
+          const comuneItems=isNewSlotFormat(slotData)?(slotData.comune||[]):(Array.isArray(slotData)?slotData:[]);
+          const personaItems=isNewSlotFormat(slotData)?(slotData[who]||[]):[];
+          const resolvedComune=comuneItems.map(item=>({
+            ...item,
+            grams:who==="giusy"?(item.gramsG??item.grams??0):(item.gramsD??item.grams??0)
+          }));
+          const allItems=[...resolvedComune,...personaItems];
+          if(!allItems.length) return null;
+          return(
+            <div key={slot.id} style={{background:"#161616",borderRadius:11,marginBottom:6,border:"1px solid #1e1e1e",overflow:"hidden"}}>
+              <div style={{padding:"8px 12px",borderBottom:"1px solid #1e1e1e",display:"flex",alignItems:"center",gap:6}}>
+                <span style={{fontSize:13}}>{slot.icon}</span>
+                <span style={{fontWeight:600,fontSize:12}}>{slot.label}</span>
+              </div>
+              <div style={{padding:"6px 9px"}}>
+                {allItems.map(({foodId,grams,note})=>{
+                  const f=getFoodOrRecipe(foodId);if(!f) return null;
+                  const m=macrosFromGrams(f,grams);
+                  return(
+                    <div key={foodId} style={{background:"#0f0f0f",borderRadius:8,padding:"7px 10px",marginBottom:4}}>
+                      <div style={{display:"flex",alignItems:"center",gap:8}}>
+                        <div style={{flex:1}}>
+                          <div style={{fontSize:12,fontWeight:600}}>{f.name}</div>
+                          <div style={{fontSize:9,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:1}}>{m.kcal} kcal · P{m.p} G{m.g} C{m.c}</div>
+                        </div>
+                        <div style={{fontSize:14,fontWeight:700,color,fontFamily:"'DM Mono',monospace",flexShrink:0}}>{grams}g</div>
+                      </div>
+                      {note&&<div style={{fontSize:9,color:"#666",marginTop:4,fontStyle:"italic"}}>📝 {note}</div>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+  };
+
+  return(
+    <div>
+      <PersonPlan who="giusy"  label="Giusy"  color="#a8e6cf"/>
+      <PersonPlan who="davide" label="Davide" color="#82b4ff"/>
+    </div>
+  );
+}
+
+// ─── WEEK VIEW ────────────────────────────────────────────────────────────────
+function WeekView({weekDates,getFoodOrRecipe,setSelectedDate,setTab,weekPlan,mealPlans,assignPlanToDay,removePlanFromDay}){
+  const [assigningDate,setAssigningDate]=useState(null);
+  const [expandedPlans,setExpandedPlans]=useState(new Set());
+
+  const getRaw=date=>weekPlan[date]??null;
+
+  const getMainPlanId=date=>{
+    const raw=getRaw(date);
+    if(!raw) return null;
+    if(typeof raw==="string") return raw;
+    if(typeof raw==="object") return raw.giusy||raw.davide||null;
+    return null;
+  };
+
+  const getPlanIds=date=>{
+    const raw=getRaw(date);
+    if(!raw) return [];
+    if(typeof raw==="string") return raw?[raw]:[];
+    if(typeof raw==="object") return [...new Set([raw.giusy,raw.davide].filter(Boolean))];
+    return [];
+  };
+
+  const isLegacyDual=date=>{
+    const raw=getRaw(date);
+    if(!raw||typeof raw!=="object") return false;
+    return raw.giusy&&raw.davide&&raw.giusy!==raw.davide;
+  };
+
+  const getPlan=id=>id?mealPlans.find(p=>p.id===id)||null:null;
+
+  return(
+    <div>
+      {assigningDate&&(
+        <ModalOverlay onClose={()=>setAssigningDate(null)}>
+          <div style={{padding:"0 18px 24px"}}>
+            <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>Assegna piano</div>
+            <div style={{fontSize:11,color:"#666",marginBottom:14}}>{fmtDateFull(assigningDate)}</div>
+            {mealPlans.length===0
+              ?<div style={{color:"#444",fontSize:12,textAlign:"center",padding:"20px 0"}}>
+                Nessun piano disponibile. Creane uno nella tab 📋.
+              </div>
+              :mealPlans.map(plan=>{
+                const isAssigned=getMainPlanId(assigningDate)===plan.id;
+                return(
+                  <div key={plan.id} onClick={()=>{assignPlanToDay(assigningDate,plan.id);setAssigningDate(null);}}
+                    className="tap"
+                    style={{background:isAssigned?"#1a2e1a":"#1a1a1a",borderRadius:10,padding:"11px 13px",marginBottom:7,
+                      border:`1px solid ${isAssigned?"#a8e6cf44":"#252525"}`,cursor:"pointer",
+                      display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                    <div style={{flex:1,marginRight:8}}>
+                      <div style={{fontWeight:600,fontSize:13,color:isAssigned?"#a8e6cf":"#e8e8e8"}}>{plan.name}</div>
+                    </div>
+                    {isAssigned&&<span style={{fontSize:16,color:"#a8e6cf"}}>✓</span>}
+                  </div>
+                );
+              })
+            }
+            {getMainPlanId(assigningDate)&&(
+              <button onClick={()=>{removePlanFromDay(assigningDate);setAssigningDate(null);}}
+                style={{width:"100%",background:"none",border:"1px solid #3a3a3a",color:"#666",borderRadius:9,padding:9,fontSize:12,cursor:"pointer",marginTop:4}}>
+                Rimuovi assegnazione
+              </button>
+            )}
+          </div>
+        </ModalOverlay>
+      )}
+
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:5}}>
+        {weekDates.map((d,i)=>{
+          const isToday=d===todayISO();
+          const planId=getMainPlanId(d);
+          const plan=getPlan(planId);
+          const dual=isLegacyDual(d);
+          return(
+            <div key={d} style={{display:"flex",flexDirection:"column",gap:4}}>
+              <div style={{textAlign:"center",padding:"5px 2px",background:isToday?"#1e2e26":"#161616",borderRadius:8,
+                border:isToday?"1px solid #a8e6cf33":"1px solid #1e1e1e",cursor:"pointer"}}
+                onClick={()=>{setSelectedDate(d);setTab("day");}}>
+                <div style={{fontSize:8,color:isToday?"#a8e6cf":"#555",fontFamily:"'DM Mono',monospace"}}>{DAYS_IT[i]}</div>
+                <div style={{fontWeight:700,fontSize:13,color:isToday?"#a8e6cf":"#bbb"}}>{d.split("-")[2]}</div>
+              </div>
+              <div onClick={e=>{e.stopPropagation();setAssigningDate(d);}}
+                className="tap"
+                style={{borderRadius:7,padding:"5px 4px",border:`1px solid ${plan?"#a8e6cf33":"#1e1e1e"}`,
+                  cursor:"pointer",minHeight:52,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",
+                  background:plan?"#142018":"#161616",gap:2}}>
+                {plan
+                  ?<>
+                    <div style={{fontSize:7,color:"#a8e6cf",textAlign:"center",lineHeight:1.3,wordBreak:"break-word",padding:"0 2px",fontWeight:600}}>
+                      {plan.name.length>14?plan.name.slice(0,13)+"…":plan.name}
+                    </div>
+                    {plan.tipologia&&<div style={{fontSize:6,color:"#a8e6cf",opacity:0.7}}>{plan.tipologia.toUpperCase()}</div>}
+                    {dual&&<div style={{fontSize:6,color:"#ffb347",background:"#ffb34722",borderRadius:3,padding:"1px 4px",marginTop:2}}>G≠D</div>}
+                  </>
+                  :<div style={{fontSize:18,color:"#252525",lineHeight:1}}>+</div>
+                }
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {(()=>{
+        const usedIds=new Set();
+        weekDates.forEach(d=>getPlanIds(d).forEach(id=>usedIds.add(id)));
+        const usedPlans=mealPlans.filter(p=>usedIds.has(p.id));
+        if(!usedPlans.length) return null;
+        return(
+          <div style={{marginTop:16}}>
+            <div style={{fontSize:10,color:"#555",letterSpacing:2,textTransform:"uppercase",fontFamily:"'DM Mono',monospace",marginBottom:8}}>Piani questa settimana</div>
+            {usedPlans.map(plan=>{
+              const isExpanded=expandedPlans.has(plan.id);
+              let kc=0,pt=0,gr=0,ca=0;
+              Object.values(plan.slots||{}).forEach(slot=>{
+                if(isNewSlotFormat(slot)){
+                  (slot.comune||[]).forEach(item=>{
+                    const f=getFoodOrRecipe(item.foodId);if(!f) return;
+                    const gG=item.gramsG??item.grams??0;const gD=item.gramsD??item.grams??0;
+                    const mG=macrosFromGrams(f,gG);const mD=macrosFromGrams(f,gD);
+                    kc+=mG.kcal+mD.kcal;pt+=mG.p+mD.p;gr+=mG.g+mD.g;ca+=mG.c+mD.c;
+                  });
+                  (slot.giusy||[]).forEach(item=>{const f=getFoodOrRecipe(item.foodId);if(!f) return;const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;});
+                  (slot.davide||[]).forEach(item=>{const f=getFoodOrRecipe(item.foodId);if(!f) return;const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;});
+                } else {
+                  (Array.isArray(slot)?slot:[]).forEach(item=>{const f=getFoodOrRecipe(item.foodId);if(!f) return;const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;});
+                }
+              });
+              const daysUsed=weekDates.filter(d=>getPlanIds(d).includes(plan.id)).length;
+              return(
+                <div key={plan.id} style={{background:"#161616",borderRadius:11,marginBottom:7,border:"1px solid #1e1e1e",overflow:"hidden"}}>
+                  <div onClick={()=>setExpandedPlans(prev=>{const next=new Set(prev);isExpanded?next.delete(plan.id):next.add(plan.id);return next;})}
+                    className="tap" style={{padding:"11px 13px",cursor:"pointer"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:6}}>
+                      <div style={{fontWeight:700,fontSize:13,flex:1,marginRight:8}}>{plan.name}</div>
+                      <div style={{display:"flex",gap:4,flexShrink:0,alignItems:"center"}}>
+                        <span style={{fontSize:9,color:"#a8e6cf",background:"#a8e6cf22",borderRadius:4,padding:"1px 6px",fontWeight:700}}>×{daysUsed}gg</span>
+                        <span style={{fontSize:10,color:"#444",marginLeft:2}}>{isExpanded?"▲":"▼"}</span>
+                      </div>
+                    </div>
+                    <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5}}>
+                      {[["kcal",Math.round(kc),""],["P",Math.round(pt*10)/10,"g"],["G",Math.round(gr*10)/10,"g"],["C",Math.round(ca*10)/10,"g"]].map(([lbl,val,unit])=>(
+                        <div key={lbl} style={{background:"#0f0f0f",borderRadius:7,padding:"6px 4px",textAlign:"center"}}>
+                          <div style={{fontSize:12,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace"}}>{val}{unit}</div>
+                          <div style={{fontSize:8,color:"#444",marginTop:1}}>{lbl}</div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  {isExpanded&&(
+                    <div style={{borderTop:"1px solid #1e1e1e",padding:"10px 13px 13px"}}>
+                      {SLOTS.map(slot=>{
+                        const slotData=(plan.slots||{})[slot.id];if(!slotData) return null;
+                        const comuneItems=isNewSlotFormat(slotData)?(slotData.comune||[]):(Array.isArray(slotData)?slotData:[]);
+                        const giusyItems=isNewSlotFormat(slotData)?(slotData.giusy||[]):[];
+                        const davideItems=isNewSlotFormat(slotData)?(slotData.davide||[]):[];
+                        if(!comuneItems.length&&!giusyItems.length&&!davideItems.length) return null;
+                        return(
+                          <div key={slot.id} style={{marginBottom:10}}>
+                            <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:5}}>
+                              <span style={{fontSize:12}}>{slot.icon}</span>
+                              <span style={{fontSize:11,fontWeight:600,color:"#bbb"}}>{slot.label}</span>
+                            </div>
+                            {comuneItems.map((item)=>{
+                              const f=getFoodOrRecipe(item.foodId);if(!f) return null;
+                              const gG=item.gramsG??item.grams??0;const gD=item.gramsD??item.grams??0;
+                              return(
+                                <div key={`c-${item.foodId}`} style={{padding:"4px 6px",marginBottom:2,borderRadius:6,background:"#0f0f0f"}}>
+                                  <div style={{display:"flex",alignItems:"center",gap:6}}>
+                                    <span style={{flex:1,fontSize:11,color:"#ccc"}}>{f.name}</span>
+                                    {item.note&&<span style={{fontSize:9,color:"#555",fontStyle:"italic"}}>📝</span>}
+                                    {gG===gD
+                                      ?<span style={{fontSize:12,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{gG}g</span>
+                                      :<div style={{display:"flex",gap:4,flexShrink:0}}>
+                                        <span style={{fontSize:8,fontWeight:700,color:"#a8e6cf",background:"#a8e6cf22",borderRadius:3,padding:"1px 4px"}}>G</span>
+                                        <span style={{fontSize:12,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace"}}>{gG}g</span>
+                                        <span style={{fontSize:8,fontWeight:700,color:"#82b4ff",background:"#82b4ff22",borderRadius:3,padding:"1px 4px",marginLeft:4}}>D</span>
+                                        <span style={{fontSize:12,fontWeight:700,color:"#82b4ff",fontFamily:"'DM Mono',monospace"}}>{gD}g</span>
+                                      </div>
+                                    }
+                                  </div>
+                                </div>
+                              );
+                            })}
+                            {giusyItems.map(({foodId,grams,note})=>{
+                              const f=getFoodOrRecipe(foodId);if(!f) return null;
+                              return(<div key={`g-${foodId}`} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 6px",marginBottom:2,borderRadius:6,background:"#0f0f0f"}}>
+                                <span style={{fontSize:8,fontWeight:700,color:"#a8e6cf",background:"#a8e6cf22",borderRadius:3,padding:"1px 4px",flexShrink:0}}>G</span>
+                                <span style={{flex:1,fontSize:11,color:"#ccc"}}>{f.name}</span>
+                                {note&&<span style={{fontSize:9,color:"#555",fontStyle:"italic"}}>📝</span>}
+                                <span style={{fontSize:12,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{grams??0}g</span>
+                              </div>);
+                            })}
+                            {davideItems.map(({foodId,grams,note})=>{
+                              const f=getFoodOrRecipe(foodId);if(!f) return null;
+                              return(<div key={`d-${foodId}`} style={{display:"flex",alignItems:"center",gap:6,padding:"4px 6px",marginBottom:2,borderRadius:6,background:"#0f0f0f"}}>
+                                <span style={{fontSize:8,fontWeight:700,color:"#82b4ff",background:"#82b4ff22",borderRadius:3,padding:"1px 4px",flexShrink:0}}>D</span>
+                                <span style={{flex:1,fontSize:11,color:"#ccc"}}>{f.name}</span>
+                                {note&&<span style={{fontSize:9,color:"#555",fontStyle:"italic"}}>📝</span>}
+                                <span style={{fontSize:12,fontWeight:700,color:"#82b4ff",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{grams??0}g</span>
+                              </div>);
+                            })}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })()}
+    </div>
+  );
+}
+
+
+// ─── FOODS VIEW ───────────────────────────────────────────────────────────────
+function FoodsView({foods,setFoods,recipes,setRecipes,stores}){
+  const [activeTab,setActiveTab]=useState("foods");
+  const [searchQ,setSearchQ]=useState("");
+  const [showAdd,setShowAdd]=useState(false);
+  const [editItem,setEditItem]=useState(null);
+  const [form,setForm]=useState({name:"",kcal:"",p:"",g:"",c:"",storeId:"",cat:""});
+  const [showAddRec,setShowAddRec]=useState(false);
+  const [editRec,setEditRec]=useState(null);
+  const [recForm,setRecForm]=useState({name:"",ingredients:[]});
+  const [ingSearch,setIngSearch]=useState("");
+
+  const filtered=activeTab==="foods"
+    ?foods.filter(f=>f.name.toLowerCase().includes(searchQ.toLowerCase()))
+    :recipes.filter(r=>r.name.toLowerCase().includes(searchQ.toLowerCase()));
+  const selStore=stores.find(s=>s.id===form.storeId);
+
+  const saveFood=()=>{
+    if(!form.name.trim()) return;
+    const item={id:editItem?.id||`f${Date.now()}`,name:form.name.trim(),kcal:+form.kcal,p:+form.p,g:+form.g,c:+form.c,storeId:form.storeId,cat:form.cat};
+    if(editItem) setFoods(p=>p.map(f=>f.id===editItem.id?item:f));
+    else setFoods(p=>[...p,item]);
+    setForm({name:"",kcal:"",p:"",g:"",c:"",storeId:"",cat:""});setShowAdd(false);setEditItem(null);
+  };
+  const startEditFood=item=>{setEditItem(item);setForm({name:item.name,kcal:item.kcal,p:item.p,g:item.g,c:item.c,storeId:item.storeId||"",cat:item.cat||""});setShowAdd(true);};
+  const deleteFood=id=>{if(window.confirm("Eliminare alimento?"))setFoods(p=>p.filter(f=>f.id!==id));};
+
+  const computeRecipeMacros=ings=>{
+    let kc=0,pt=0,gr=0,ca=0,tw=0;
+    ings.forEach(ing=>{const f=foods.find(x=>x.id===ing.foodId);if(!f) return;const fc=ing.grams/100;kc+=f.kcal*fc;pt+=f.p*fc;gr+=f.g*fc;ca+=f.c*fc;tw+=ing.grams;});
+    if(!tw) return{kcal:0,p:0,g:0,c:0};
+    return{kcal:Math.round((kc/tw)*100),p:Math.round((pt/tw)*100*10)/10,g:Math.round((gr/tw)*100*10)/10,c:Math.round((ca/tw)*100*10)/10};
+  };
+  const saveRecipe=()=>{
+    if(!recForm.name||!recForm.ingredients.length) return;
+    const m=computeRecipeMacros(recForm.ingredients);
+    const item={id:editRec?.id||`r${Date.now()}`,name:recForm.name,...m,ingredients:recForm.ingredients};
+    if(editRec) setRecipes(p=>p.map(r=>r.id===editRec.id?item:r));
+    else setRecipes(p=>[...p,item]);
+    setRecForm({name:"",ingredients:[]});setShowAddRec(false);setEditRec(null);
+  };
+  const deleteRecipe=id=>{if(window.confirm("Eliminare ricetta?"))setRecipes(p=>p.filter(r=>r.id!==id));};
+  const ingFiltered=foods.filter(f=>f.name.toLowerCase().includes(ingSearch.toLowerCase()));
+
+  const storeGroups={};
+  filtered.forEach(f=>{
+    const s=stores.find(x=>x.id===f.storeId);
+    const k=s?s.name:"Senza negozio";
+    if(!storeGroups[k]) storeGroups[k]=[];
+    storeGroups[k].push(f);
+  });
+
+  return(
+    <div>
+      <div style={{display:"flex",gap:6,marginBottom:12}}>
+        {["foods","recipes"].map(t=>(
+          <button key={t} onClick={()=>setActiveTab(t)}
+            style={{flex:1,padding:"8px",borderRadius:9,border:"none",fontWeight:600,fontSize:12,cursor:"pointer",
+              background:activeTab===t?"#a8e6cf":"#161616",color:activeTab===t?"#0f0f0f":"#555"}}>
+            {t==="foods"?"🥩 Alimenti":"📖 Ricette"}
+          </button>
+        ))}
+      </div>
+      <div style={{display:"flex",gap:7,marginBottom:12}}>
+        <input placeholder={`Cerca ${activeTab==="foods"?"alimento":"ricetta"}...`} value={searchQ} onChange={e=>setSearchQ(e.target.value)}
+          style={{flex:1,background:"#161616",border:"1px solid #252525",color:"#fff",borderRadius:9,padding:"8px 11px",fontSize:13}}/>
+        <button onClick={()=>{if(activeTab==="foods"){setShowAdd(true);setEditItem(null);setForm({name:"",kcal:"",p:"",g:"",c:"",storeId:"",cat:""});}else{setShowAddRec(true);setEditRec(null);setRecForm({name:"",ingredients:[]});}}}
+          style={{background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:9,padding:"0 16px",fontWeight:700,fontSize:18,cursor:"pointer"}}>+</button>
+      </div>
+      {showAdd&&activeTab==="foods"&&(
+        <div style={{background:"#161616",borderRadius:13,padding:13,marginBottom:12,border:"1px solid #a8e6cf22"}}>
+          <div style={{fontWeight:700,marginBottom:10}}>{editItem?"Modifica":"Nuovo"} alimento</div>
+          <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Nome</label>
+          <input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="es. Petto di pollo"
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"8px 10px",fontSize:13,marginBottom:10}}/>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr",gap:7,marginBottom:10}}>
+            {[["kcal","Kcal/100g"],["p","Prot (g)"],["g","Grassi (g)"],["c","Carbo (g)"]].map(([k,lbl])=>(
+              <div key={k}>
+                <label style={{fontSize:10,color:"#666",display:"block",marginBottom:3}}>{lbl}</label>
+                <input type="number" value={form[k]} onChange={e=>setForm(f=>({...f,[k]:e.target.value}))}
+                  style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"7px 6px",fontSize:12,textAlign:"center"}}/>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
+            <div>
+              <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Supermercato</label>
+              <select value={form.storeId} onChange={e=>setForm(f=>({...f,storeId:e.target.value,cat:""}))}
+                style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:form.storeId?"#fff":"#555",borderRadius:7,padding:"7px 8px",fontSize:12}}>
+                <option value="">Nessuno</option>
+                {stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Categoria</label>
+              <select value={form.cat} onChange={e=>setForm(f=>({...f,cat:e.target.value}))} disabled={!form.storeId}
+                style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:form.cat?"#fff":"#555",borderRadius:7,padding:"7px 8px",fontSize:12,opacity:form.storeId?1:0.4}}>
+                <option value="">Seleziona...</option>
+                {(selStore?.cats||[]).map(c=><option key={c} value={c}>{c}</option>)}
+              </select>
+            </div>
+          </div>
+          <div style={{display:"flex",gap:7}}>
+            <button onClick={saveFood} style={{flex:1,background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:8,padding:9,fontWeight:700,cursor:"pointer"}}>Salva</button>
+            <button onClick={()=>{setShowAdd(false);setEditItem(null);}} style={{flex:1,background:"#252525",color:"#bbb",border:"none",borderRadius:8,padding:9,cursor:"pointer"}}>Annulla</button>
+          </div>
+        </div>
+      )}
+      {showAddRec&&activeTab==="recipes"&&(
+        <div style={{background:"#161616",borderRadius:13,padding:13,marginBottom:12,border:"1px solid #a8e6cf22"}}>
+          <div style={{fontWeight:700,marginBottom:10}}>{editRec?"Modifica":"Nuova"} ricetta</div>
+          <input placeholder="Nome ricetta" value={recForm.name} onChange={e=>setRecForm(f=>({...f,name:e.target.value}))}
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"8px 10px",fontSize:13,marginBottom:10}}/>
+          <div style={{fontWeight:600,fontSize:12,marginBottom:6,color:"#777"}}>Ingredienti</div>
+          {recForm.ingredients.map((ing,i)=>{
+            const food=foods.find(f=>f.id===ing.foodId);
+            return(
+              <div key={i} style={{display:"flex",gap:6,alignItems:"center",marginBottom:6,background:"#0f0f0f",borderRadius:7,padding:"6px 8px"}}>
+                <span style={{flex:1,fontSize:12,color:"#ccc"}}>{food?.name}</span>
+                <input type="number" value={ing.grams} onChange={e=>setRecForm(f=>({...f,ingredients:f.ingredients.map((ii,j)=>j===i?{...ii,grams:+e.target.value}:ii)}))}
+                  style={{width:58,background:"#1a1a1a",border:"1px solid #2a2a2a",color:"#fff",borderRadius:6,padding:"4px 6px",fontSize:12,textAlign:"center"}}/>
+                <span style={{fontSize:10,color:"#444"}}>g</span>
+                <button onClick={()=>setRecForm(f=>({...f,ingredients:f.ingredients.filter((_,j)=>j!==i)}))}
+                  style={{background:"none",border:"none",color:"#555",fontSize:16,cursor:"pointer"}}>×</button>
+              </div>
+            );
+          })}
+          <input placeholder="Cerca ingrediente..." value={ingSearch} onChange={e=>setIngSearch(e.target.value)}
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"7px 10px",fontSize:12,marginBottom:4,marginTop:6}}/>
+          {ingSearch&&(
+            <div style={{background:"#0f0f0f",borderRadius:8,border:"1px solid #252525",maxHeight:140,overflowY:"auto",marginBottom:8}}>
+              {ingFiltered.slice(0,8).map(f=>(
+                <div key={f.id} onClick={()=>{setRecForm(rf=>({...rf,ingredients:[...rf.ingredients,{foodId:f.id,grams:100}]}));setIngSearch("");}}
+                  style={{padding:"8px 10px",cursor:"pointer",borderBottom:"1px solid #161616",fontSize:12,color:"#ccc",display:"flex",justifyContent:"space-between"}}>
+                  <span>{f.name}</span><span style={{color:"#444",fontFamily:"'DM Mono',monospace"}}>{f.kcal}kc</span>
+                </div>
+              ))}
+              {ingFiltered.length===0&&<div style={{padding:"8px 10px",fontSize:12,color:"#444"}}>Nessun risultato</div>}
+            </div>
+          )}
+          <div style={{display:"flex",gap:7,marginTop:8}}>
+            <button onClick={saveRecipe} style={{flex:1,background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:8,padding:9,fontWeight:700,cursor:"pointer"}}>Salva</button>
+            <button onClick={()=>{setShowAddRec(false);setEditRec(null);}} style={{flex:1,background:"#252525",color:"#bbb",border:"none",borderRadius:8,padding:9,cursor:"pointer"}}>Annulla</button>
+          </div>
+        </div>
+      )}
+      {activeTab==="foods"&&(
+        filtered.length===0
+          ?<div style={{textAlign:"center",color:"#333",padding:"40px 0",fontSize:13}}><div style={{fontSize:36,marginBottom:8}}>🥩</div>Nessun alimento. Aggiungine uno con +</div>
+          :Object.entries(storeGroups).map(([storeName,items],si)=>{
+            const sc=STORE_COLORS[si%STORE_COLORS.length];
+            return(
+              <div key={storeName} style={{marginBottom:16}}>
+                <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:7,paddingLeft:2}}>
+                  <div style={{width:3,height:14,background:sc,borderRadius:2}}/>
+                  <span style={{fontSize:10,color:sc,fontWeight:700,letterSpacing:2,textTransform:"uppercase",fontFamily:"'DM Mono',monospace"}}>🏪 {storeName}</span>
+                </div>
+                {items.map(item=>(
+                  <div key={item.id} style={{background:"#161616",borderRadius:11,padding:"11px 13px",marginBottom:6,border:"1px solid #1e1e1e",display:"flex",alignItems:"center",gap:9}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontWeight:600,fontSize:13}}>{item.name}</div>
+                      <div style={{fontSize:10,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:2}}>{item.kcal} kcal · P{item.p} G{item.g} C{item.c} /100g</div>
+                      {item.cat&&<div style={{fontSize:9,color:"#555",marginTop:2}}>{item.cat}</div>}
+                    </div>
+                    <button onClick={()=>startEditFood(item)} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:7,padding:"5px 9px",fontSize:13,cursor:"pointer"}}>✏️</button>
+                    <button onClick={()=>deleteFood(item.id)} style={{background:"#252525",border:"none",color:"#ff6b6b",borderRadius:7,padding:"5px 9px",fontSize:13,cursor:"pointer"}}>🗑️</button>
+                  </div>
+                ))}
+              </div>
+            );
+          })
+      )}
+      {activeTab==="recipes"&&(
+        filtered.length===0
+          ?<div style={{textAlign:"center",color:"#333",padding:"40px 0",fontSize:13}}><div style={{fontSize:36,marginBottom:8}}>📖</div>Nessuna ricetta. Aggiungine una con +</div>
+          :filtered.map(item=>(
+            <div key={item.id} style={{background:"#161616",borderRadius:11,padding:"11px 13px",marginBottom:7,border:"1px solid #1e1e1e",display:"flex",alignItems:"center",gap:9}}>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:600,fontSize:13}}>{item.name}</div>
+                <div style={{fontSize:10,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:2}}>{item.kcal} kcal · P{item.p} G{item.g} C{item.c} /100g</div>
+                {item.ingredients&&<div style={{fontSize:10,color:"#555",marginTop:2}}>{item.ingredients.length} ingredienti</div>}
+              </div>
+              <button onClick={()=>{setEditRec(item);setRecForm({name:item.name,ingredients:item.ingredients||[]});setShowAddRec(true);}}
+                style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:7,padding:"5px 9px",fontSize:13,cursor:"pointer"}}>✏️</button>
+              <button onClick={()=>deleteRecipe(item.id)} style={{background:"#252525",border:"none",color:"#ff6b6b",borderRadius:7,padding:"5px 9px",fontSize:13,cursor:"pointer"}}>🗑️</button>
+            </div>
+          ))
+      )}
+    </div>
+  );
+}
+
+// ─── SHOPPING VIEW ────────────────────────────────────────────────────────────
+function ShoppingView({weekDates,buildShoppingListFromPlans,weekPlan,mealPlans,stores,setStores,manualItems,setManualItems}){
+  const [range,setRange]=useState({from:weekDates[0],to:weekDates[6]});
+  const [checked,setChecked]=useState({});
+  const [selStore,setSelStore]=useState("all");
+  const [collapsed,setCollapsed]=useState({});
+
+  // Form articolo manuale
+  const [showForm,setShowForm]=useState(false);
+  const [mForm,setMForm]=useState({name:"",storeId:"",cat:"",newCat:""});
+
+  const selectedDates=weekDates.filter(d=>d>=range.from&&d<=range.to);
+
+  // Lista da piani — INVARIATA
+  const planList=buildShoppingListFromPlans(selectedDates);
+
+  // Normalizzazione categoria: trim + confronto case-insensitive
+  const normalizeCategory=(storeId,rawCat)=>{
+    const trimmed=rawCat.trim();
+    if(!trimmed||!storeId) return trimmed;
+    const store=stores.find(s=>s.id===storeId);
+    if(!store) return trimmed;
+    const existing=store.cats.find(c=>c.toLowerCase()===trimmed.toLowerCase());
+    if(existing) return existing; // riutilizza la capitalizzazione esistente
+    // Nuova categoria: prima lettera maiuscola, resto invariato
+    const normalized=trimmed.charAt(0).toUpperCase()+trimmed.slice(1);
+    // Aggiunge al supermercato in stores
+    setStores(prev=>prev.map(s=>s.id===storeId?{...s,cats:[...s.cats,normalized]}:s));
+    return normalized;
+  };
+
+  const addManualItem=()=>{
+    if(!mForm.name.trim()) return;
+    const rawCat=mForm.newCat.trim()||mForm.cat;
+    const cat=normalizeCategory(mForm.storeId,rawCat);
+    const item={
+      id:`m${Date.now()}`,
+      name:mForm.name.trim(),
+      storeId:mForm.storeId,
+      cat,
+      favorite:true,
+    };
+    setManualItems(prev=>[...prev,item]);
+    setMForm({name:"",storeId:"",cat:"",newCat:""});
+    setShowForm(false);
+  };
+
+  const deleteManualItem=id=>setManualItems(prev=>prev.filter(i=>i.id!==id));
+
+  // Costruisce grouped unificando lista piani + articoli manuali
+  const grouped={};
+  stores.forEach(s=>{
+    grouped[s.name]={storeId:s.id,cats:{},count:0,color:STORE_COLORS[stores.indexOf(s)%STORE_COLORS.length]};
+  });
+
+  // Articoli da piani
+  planList.forEach(({item,total})=>{
+    const s=stores.find(x=>x.id===item.storeId);
+    const sName=s?s.name:"Senza negozio";
+    const cat=item.cat||"Altro";
+    if(!grouped[sName]) grouped[sName]={storeId:null,cats:{},count:0,color:"#888"};
+    if(!grouped[sName].cats[cat]) grouped[sName].cats[cat]=[];
+    grouped[sName].cats[cat].push({item,total,isManual:false});
+    grouped[sName].count++;
+  });
+
+  // Articoli manuali
+  manualItems.forEach(item=>{
+    const s=stores.find(x=>x.id===item.storeId);
+    const sName=s?s.name:"Senza negozio";
+    const cat=item.cat||"Altro";
+    if(!grouped[sName]) grouped[sName]={storeId:null,cats:{},count:0,color:"#888"};
+    if(!grouped[sName].cats[cat]) grouped[sName].cats[cat]=[];
+    grouped[sName].cats[cat].push({item,total:null,isManual:true});
+    grouped[sName].count++;
+  });
+
+  const activeStores=Object.keys(grouped).filter(n=>grouped[n].count>0);
+  const displayStores=selStore==="all"?activeStores:activeStores.filter(n=>n===selStore);
+  const toggle=id=>setChecked(p=>({...p,[id]:!p[id]}));
+  const toggleCollapse=n=>setCollapsed(p=>({...p,[n]:!p[n]}));
+  const totalItems=planList.length+manualItems.length;
+  const checkedCount=Object.values(checked).filter(Boolean).length;
+
+  const selStoreObj=stores.find(s=>s.id===mForm.storeId);
+  const existingCats=selStoreObj?.cats||[];
+
+  return(
+    <div>
+      {/* Periodo spesa */}
+      <div style={{background:"#161616",borderRadius:13,padding:"11px 13px",marginBottom:11,border:"1px solid #1e1e1e"}}>
+        <div style={{fontSize:11,color:"#666",marginBottom:7}}>Periodo spesa</div>
+        <div style={{display:"flex",gap:7,alignItems:"center"}}>
+          <select value={range.from} onChange={e=>setRange(r=>({...r,from:e.target.value}))}
+            style={{flex:1,background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#bbb",borderRadius:7,padding:"6px 8px",fontSize:11}}>
+            {weekDates.map(d=><option key={d} value={d}>{fmtDateFull(d)}</option>)}
+          </select>
+          <span style={{color:"#444"}}>→</span>
+          <select value={range.to} onChange={e=>setRange(r=>({...r,to:e.target.value}))}
+            style={{flex:1,background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#bbb",borderRadius:7,padding:"6px 8px",fontSize:11}}>
+            {weekDates.map(d=><option key={d} value={d}>{fmtDateFull(d)}</option>)}
+          </select>
+        </div>
+      </div>
+
+      {/* Pulsante aggiungi articolo + form */}
+      <div style={{marginBottom:11}}>
+        {!showForm
+          ?<button onClick={()=>setShowForm(true)} className="tap"
+            style={{width:"100%",background:"#161616",color:"#a8e6cf",border:"1px solid #a8e6cf33",
+              borderRadius:10,padding:"10px 14px",fontWeight:700,fontSize:13,cursor:"pointer",
+              display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+            <span style={{fontSize:16}}>+</span><span>Aggiungi articolo</span>
+          </button>
+          :<div style={{background:"#161616",borderRadius:13,padding:13,border:"1px solid #a8e6cf33"}}>
+            <div style={{fontWeight:700,fontSize:13,marginBottom:10,color:"#a8e6cf"}}>Nuovo articolo</div>
+            {/* Nome */}
+            <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Nome articolo *</label>
+            <input autoFocus value={mForm.name} onChange={e=>setMForm(f=>({...f,name:e.target.value}))}
+              placeholder="es. Carta igienica"
+              style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"8px 10px",fontSize:13,marginBottom:10}}/>
+            {/* Supermercato */}
+            <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Supermercato</label>
+            <select value={mForm.storeId} onChange={e=>setMForm(f=>({...f,storeId:e.target.value,cat:"",newCat:""}))}
+              style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:mForm.storeId?"#fff":"#555",borderRadius:7,padding:"7px 8px",fontSize:12,marginBottom:10}}>
+              <option value="">Nessuno</option>
+              {stores.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}
+            </select>
+            {/* Categoria */}
+            {mForm.storeId&&(
+              <>
+                <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Categoria</label>
+                <select value={mForm.cat} onChange={e=>setMForm(f=>({...f,cat:e.target.value,newCat:""}))}
+                  style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:mForm.cat?"#fff":"#555",borderRadius:7,padding:"7px 8px",fontSize:12,marginBottom:mForm.cat==="__new__"?8:10}}>
+                  <option value="">Seleziona categoria...</option>
+                  {existingCats.map(c=><option key={c} value={c}>{c}</option>)}
+                  <option value="__new__">+ Nuova categoria...</option>
+                </select>
+                {mForm.cat==="__new__"&&(
+                  <input value={mForm.newCat} onChange={e=>setMForm(f=>({...f,newCat:e.target.value}))}
+                    placeholder="Nome nuova categoria"
+                    style={{width:"100%",background:"#0f0f0f",border:"1px solid #a8e6cf44",color:"#fff",borderRadius:7,padding:"7px 10px",fontSize:12,marginBottom:10}}/>
+                )}
+              </>
+            )}
+            {/* Bottoni */}
+            <div style={{display:"flex",gap:7,marginTop:4}}>
+              <button onClick={addManualItem} disabled={!mForm.name.trim()}
+                style={{flex:1,background:mForm.name.trim()?"#a8e6cf":"#252525",color:mForm.name.trim()?"#0f0f0f":"#555",
+                  border:"none",borderRadius:8,padding:9,fontWeight:700,fontSize:13,cursor:"pointer"}}>
+                Aggiungi
+              </button>
+              <button onClick={()=>{setShowForm(false);setMForm({name:"",storeId:"",cat:"",newCat:""}); }}
+                style={{flex:1,background:"#252525",color:"#bbb",border:"none",borderRadius:8,padding:9,cursor:"pointer"}}>
+                Annulla
+              </button>
+            </div>
+          </div>
+        }
+      </div>
+
+      {/* Filtro per negozio */}
+      <div style={{display:"flex",gap:5,overflowX:"auto",paddingBottom:6,marginBottom:10}}>
+        <button onClick={()=>setSelStore("all")} className="tap"
+          style={{flexShrink:0,padding:"5px 12px",borderRadius:20,border:"none",fontSize:11,fontWeight:600,cursor:"pointer",
+            background:selStore==="all"?"#a8e6cf":"#161616",color:selStore==="all"?"#0f0f0f":"#555"}}>
+          Tutti ({totalItems})
+        </button>
+        {activeStores.map(n=>(
+          <button key={n} onClick={()=>setSelStore(n)} className="tap"
+            style={{flexShrink:0,padding:"5px 12px",borderRadius:20,border:"none",fontSize:11,fontWeight:600,cursor:"pointer",
+              background:selStore===n?grouped[n].color:"#161616",color:selStore===n?"#0f0f0f":"#555"}}>
+            {n} ({grouped[n].count})
+          </button>
+        ))}
+      </div>
+
+      {/* Contatore e reset spunte */}
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <span style={{fontSize:12,color:"#555"}}>{checkedCount}/{totalItems} spuntati</span>
+        <button onClick={()=>setChecked({})} style={{background:"none",border:"none",color:"#555",fontSize:11,cursor:"pointer"}}>Reset ✕</button>
+      </div>
+
+      {totalItems===0&&(
+        <div style={{textAlign:"center",color:"#333",padding:"48px 0",fontSize:13}}>
+          <div style={{fontSize:42,marginBottom:10}}>🛒</div>
+          <div>Nessun articolo in lista.</div>
+          <div style={{marginTop:4,color:"#2a2a2a"}}>Assegna piani dalla tab 🗓️ o aggiungi articoli manuali.</div>
+        </div>
+      )}
+
+      {/* Lista raggruppata per negozio */}
+      {displayStores.map(storeName=>{
+        const sg=grouped[storeName];
+        const sc=sg.color;
+        const isOpen=!collapsed[storeName];
+        const allItems=Object.values(sg.cats).flat();
+        const storeChecked=allItems.filter(({item})=>checked[item.id]).length;
+        return(
+          <div key={storeName} style={{marginBottom:14,borderRadius:14,overflow:"hidden",border:`1px solid ${sc}33`}}>
+            <div onClick={()=>toggleCollapse(storeName)} className="tap"
+              style={{display:"flex",alignItems:"center",gap:10,padding:"12px 14px",cursor:"pointer",
+                background:`linear-gradient(135deg,#1a1a1a 0%,${sc}14 100%)`,borderBottom:isOpen?`1px solid ${sc}22`:"none"}}>
+              <span style={{fontSize:20}}>🏪</span>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:700,fontSize:15}}>{storeName}</div>
+                <div style={{fontSize:10,color:"#666",marginTop:1,fontFamily:"'DM Mono',monospace"}}>
+                  {storeChecked}/{allItems.length} articoli · {Object.keys(sg.cats).length} categorie
+                </div>
+              </div>
+              <svg width={34} height={34}>
+                <circle cx={17} cy={17} r={13} fill="none" stroke="#2a2a2a" strokeWidth={3}/>
+                <circle cx={17} cy={17} r={13} fill="none" stroke={sc} strokeWidth={3}
+                  strokeDasharray={`${allItems.length>0?storeChecked/allItems.length*82:0} 82`}
+                  strokeLinecap="round" transform="rotate(-90 17 17)"/>
+                <text x={17} y={21} textAnchor="middle" fill={sc} fontSize={8} fontWeight={700} fontFamily="'DM Mono',monospace">
+                  {allItems.length>0?Math.round(storeChecked/allItems.length*100):0}%
+                </text>
+              </svg>
+              <span style={{color:"#555",fontSize:12}}>{isOpen?"▲":"▼"}</span>
+            </div>
+            {isOpen&&(
+              <div style={{background:"#141414",padding:"10px 12px 14px"}}>
+                {Object.entries(sg.cats).map(([cat,items],ci,arr)=>(
+                  <div key={cat} style={{marginBottom:ci<arr.length-1?14:0}}>
+                    <div style={{display:"flex",alignItems:"center",gap:7,marginBottom:7}}>
+                      <div style={{width:3,height:14,background:sc,borderRadius:2,flexShrink:0}}/>
+                      <span style={{fontSize:10,color:sc,fontWeight:700,letterSpacing:2,textTransform:"uppercase",fontFamily:"'DM Mono',monospace"}}>{cat}</span>
+                      <span style={{fontSize:10,color:"#444"}}>({items.length})</span>
+                    </div>
+                    {items.map(({item,total,isManual})=>(
+                      <div key={item.id} style={{background:checked[item.id]?"#111":"#1a1a1a",borderRadius:9,padding:"9px 12px",marginBottom:5,
+                        border:`1px solid ${checked[item.id]?"#1e1e1e":sc+"22"}`,
+                        display:"flex",alignItems:"center",gap:9,opacity:checked[item.id]?0.4:1,transition:"all 0.2s"}}>
+                        {/* Checkbox */}
+                        <div onClick={()=>toggle(item.id)} className="tap" style={{width:20,height:20,borderRadius:6,flexShrink:0,cursor:"pointer",
+                          border:checked[item.id]?"none":`1.5px solid #3a3a3a`,
+                          background:checked[item.id]?sc:"transparent",
+                          display:"flex",alignItems:"center",justifyContent:"center"}}>
+                          {checked[item.id]&&<span style={{fontSize:12,color:"#0f0f0f",fontWeight:700}}>✓</span>}
+                        </div>
+                        {/* Nome */}
+                        <span onClick={()=>toggle(item.id)} className="tap" style={{flex:1,fontSize:13,cursor:"pointer",
+                          textDecoration:checked[item.id]?"line-through":"none",
+                          color:checked[item.id]?"#555":"#e8e8e8"}}>
+                          {item.name}
+                        </span>
+                        {/* Grammi (solo articoli da piani) */}
+                        {!isManual&&total!=null&&(
+                          <div style={{textAlign:"right",flexShrink:0}}>
+                            <div style={{fontSize:15,fontWeight:700,color:sc,fontFamily:"'DM Mono',monospace"}}>{Math.round(total)}g</div>
+                          </div>
+                        )}
+                        {/* Elimina (solo articoli manuali) */}
+                        {isManual&&(
+                          <button onClick={()=>deleteManualItem(item.id)}
+                            style={{background:"none",border:"none",color:"#3a3a3a",fontSize:16,padding:0,cursor:"pointer",flexShrink:0,lineHeight:1}}>
+                            🗑️
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── SETTINGS VIEW ────────────────────────────────────────────────────────────
+function SettingsView({stores,setStores,foods,setFoods,resetAll,applyImport}){
+  const [storeEdit,setStoreEdit]=useState(null);
+  const [storeForm,setStoreForm]=useState({name:"",cats:[]});
+  const [newCat,setNewCat]=useState("");
+
+  // ─── BACKUP ────────────────────────────────────────────────────────────────
+  const [importStatus,setImportStatus]=useState(null);
+  const [importMsg,setImportMsg]=useState("");
+  const importRef=React.useRef(null);
+
+  const handleExport=()=>{
+    const payload={
+      _version:2, _app:"NutritionHub", _date:new Date().toISOString(),
+      foods:       load(SK.FOODS,[]),
+      recipes:     load(SK.RECIPES,[]),
+      stores:      load(SK.STORES,DEFAULT_STORES),
+      plans:       load(SK.PLANS,[]),
+      weekPlan:    load(SK.WEEK_PLAN,{}),
+      manualItems: load(SK.MANUAL_ITEMS,[]),
+    };
+    const blob=new Blob([JSON.stringify(payload,null,2)],{type:"application/json"});
+    const url=URL.createObjectURL(blob);
+    const a=document.createElement("a");
+    const dateStr=new Date().toISOString().split("T")[0];
+    a.href=url;
+    a.download=`nutrition-hub-backup-${dateStr}.json`;
+    document.body.appendChild(a);a.click();
+    document.body.removeChild(a);URL.revokeObjectURL(url);
+  };
+
+  const handleImportFile=(e)=>{
+    const file=e.target.files?.[0];
+    if(!file) return;
+    e.target.value="";
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      let data;
+      try{ data=JSON.parse(ev.target.result); }
+      catch{
+        setImportStatus("error");
+        setImportMsg("File non valido: impossibile leggere il JSON.");
+        return;
+      }
+      if(data._app&&data._app!=="NutritionHub"){
+        setImportStatus("invalid");setImportMsg("Il file non sembra essere un backup di Nutrition Hub.");return;
+      }
+      if(!data.foods&&!data.plans){
+        setImportStatus("invalid");setImportMsg("File non compatibile: struttura non riconosciuta.");return;
+      }
+      const dateLabel=data._date?` del ${new Date(data._date).toLocaleDateString("it-IT")}`:"";
+      if(!window.confirm(`Importare il backup${dateLabel}?\n\nTutti i dati attuali verranno sovrascritti.\nQuesta azione non può essere annullata.`)){
+        setImportStatus(null);return;
+      }
+      if(data.foods)        save(SK.FOODS,data.foods);
+      if(data.recipes)      save(SK.RECIPES,data.recipes);
+      if(data.stores)       save(SK.STORES,data.stores);
+      if(data.plans)        save(SK.PLANS,data.plans);
+      if(data.weekPlan)     save(SK.WEEK_PLAN,data.weekPlan);
+      if(data.manualItems)  save(SK.MANUAL_ITEMS,data.manualItems);
+      applyImport(data);
+      setImportStatus("ok");setImportMsg(`Dati ripristinati correttamente${dateLabel}.`);
+    };
+    reader.readAsText(file);
+  };
+  // ──────────────────────────────────────────────────────────────────────────
+
+  const openNewStore=()=>{setStoreEdit("new");setStoreForm({name:"",cats:[]});setNewCat("");};
+  const openEditStore=s=>{setStoreEdit(s);setStoreForm({name:s.name,cats:[...s.cats]});setNewCat("");};
+  const addCat=()=>{if(newCat.trim()&&!storeForm.cats.includes(newCat.trim())){setStoreForm(f=>({...f,cats:[...f.cats,newCat.trim()]}));setNewCat("");}};
+  const saveStore=()=>{
+    if(!storeForm.name.trim()) return;
+    if(storeEdit==="new"){
+      setStores(p=>[...p,{id:`s${Date.now()}`,name:storeForm.name.trim(),cats:storeForm.cats}]);
+    }else{
+      setFoods(prev=>prev.map(f=>f.storeId===storeEdit.id&&!storeForm.cats.includes(f.cat)?{...f,cat:""}:f));
+      setStores(p=>p.map(s=>s.id===storeEdit.id?{...s,name:storeForm.name.trim(),cats:storeForm.cats}:s));
+    }
+    setStoreEdit(null);
+  };
+  const deleteStore=id=>{
+    if(!window.confirm("Eliminare supermercato?")) return;
+    setStores(p=>p.filter(s=>s.id!==id));
+    setFoods(prev=>prev.map(f=>f.storeId===id?{...f,storeId:"",cat:""}:f));
+  };
+
+  if(storeEdit!==null){
+    return(
+      <div>
+        <div style={{fontWeight:700,fontSize:16,marginBottom:14}}>{storeEdit==="new"?"Nuovo":"Modifica"} supermercato</div>
+        <div style={{background:"#161616",borderRadius:13,padding:13,marginBottom:12,border:"1px solid #1e1e1e"}}>
+          <label style={{fontSize:11,color:"#666",display:"block",marginBottom:4}}>Nome</label>
+          <input value={storeForm.name} onChange={e=>setStoreForm(f=>({...f,name:e.target.value}))}
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"8px 10px",fontSize:13,marginBottom:12}}/>
+          <div style={{fontWeight:600,fontSize:12,marginBottom:7,color:"#888"}}>Sottocategorie</div>
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:10}}>
+            {storeForm.cats.map(c=>(
+              <div key={c} style={{display:"flex",alignItems:"center",gap:4,background:"#0f0f0f",borderRadius:20,padding:"4px 10px",border:"1px solid #2a2a2a"}}>
+                <span style={{fontSize:12}}>{c}</span>
+                <button onClick={()=>setStoreForm(f=>({...f,cats:f.cats.filter(x=>x!==c)}))}
+                  style={{background:"none",border:"none",color:"#555",fontSize:14,lineHeight:1,padding:0,cursor:"pointer"}}>×</button>
+              </div>
+            ))}
+          </div>
+          <div style={{display:"flex",gap:7}}>
+            <input value={newCat} onChange={e=>setNewCat(e.target.value)} placeholder="Nuova sottocategoria..."
+              onKeyDown={e=>e.key==="Enter"&&addCat()}
+              style={{flex:1,background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"7px 10px",fontSize:12}}/>
+            <button onClick={addCat} style={{background:"#a8e6cf22",border:"1px solid #a8e6cf44",color:"#a8e6cf",borderRadius:7,padding:"0 14px",fontSize:18,fontWeight:700,cursor:"pointer"}}>+</button>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button onClick={saveStore} style={{flex:1,background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:10,padding:10,fontWeight:700,cursor:"pointer"}}>Salva</button>
+          <button onClick={()=>setStoreEdit(null)} style={{flex:1,background:"#252525",color:"#bbb",border:"none",borderRadius:10,padding:10,cursor:"pointer"}}>Annulla</button>
+        </div>
+      </div>
+    );
+  }
+
+  return(
+    <div>
+      <div style={{background:"#161616",borderRadius:14,padding:14,marginBottom:14,border:"1px solid #1e1e1e"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+          <div style={{fontWeight:700,fontSize:15}}>Supermercati</div>
+          <button onClick={openNewStore} style={{background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:8,padding:"6px 12px",fontSize:12,fontWeight:700,cursor:"pointer"}}>+ Aggiungi</button>
+        </div>
+        {stores.map((s,si)=>(
+          <div key={s.id} style={{background:"#0f0f0f",borderRadius:10,padding:"10px 12px",marginBottom:8,border:`1px solid ${STORE_COLORS[si%STORE_COLORS.length]}22`}}>
+            <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+              <span style={{fontSize:16}}>🏪</span>
+              <div style={{flex:1}}>
+                <div style={{fontWeight:600,fontSize:13}}>{s.name}</div>
+                <div style={{fontSize:10,color:"#555",marginTop:1}}>{s.cats.length} categorie</div>
+              </div>
+              <button onClick={()=>openEditStore(s)} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:7,padding:"4px 8px",fontSize:12,cursor:"pointer"}}>✏️</button>
+              <button onClick={()=>deleteStore(s.id)} style={{background:"#252525",border:"none",color:"#ff6b6b",borderRadius:7,padding:"4px 8px",fontSize:12,cursor:"pointer"}}>🗑️</button>
+            </div>
+            <div style={{display:"flex",flexWrap:"wrap",gap:4}}>
+              {s.cats.map(c=><span key={c} style={{fontSize:9,color:"#666",background:"#1a1a1a",borderRadius:4,padding:"2px 6px"}}>{c}</span>)}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{background:"#161616",borderRadius:14,padding:14,marginBottom:14,border:"1px solid #1e1e1e"}}>
+        <div style={{fontWeight:700,fontSize:15,marginBottom:4}}>💾 Backup & Ripristino</div>
+        <div style={{fontSize:11,color:"#666",marginBottom:14}}>
+          Esporta tutti i dati in un file JSON da conservare o trasferire su un altro dispositivo.
+        </div>
+        <button onClick={handleExport} className="tap"
+          style={{width:"100%",background:"#1a2e1a",color:"#a8e6cf",border:"1px solid #a8e6cf33",
+            borderRadius:10,padding:"11px 14px",fontWeight:700,fontSize:13,cursor:"pointer",
+            display:"flex",alignItems:"center",justifyContent:"center",gap:8,marginBottom:10}}>
+          <span style={{fontSize:18}}>📤</span><span>Esporta dati</span>
+        </button>
+        <input ref={importRef} type="file" accept=".json,application/json"
+          onChange={handleImportFile} style={{display:"none"}}/>
+        <button onClick={()=>{setImportStatus(null);importRef.current&&importRef.current.click();}} className="tap"
+          style={{width:"100%",background:"#1a1a2e",color:"#82b4ff",border:"1px solid #82b4ff33",
+            borderRadius:10,padding:"11px 14px",fontWeight:700,fontSize:13,cursor:"pointer",
+            display:"flex",alignItems:"center",justifyContent:"center",gap:8}}>
+          <span style={{fontSize:18}}>📥</span><span>Importa dati</span>
+        </button>
+        {importStatus==="ok"&&(
+          <div style={{marginTop:10,background:"#1a2e1a",border:"1px solid #a8e6cf44",borderRadius:9,
+            padding:"9px 12px",fontSize:12,color:"#a8e6cf",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:16}}>✅</span><span>{importMsg}</span>
+          </div>
+        )}
+        {(importStatus==="error"||importStatus==="invalid")&&(
+          <div style={{marginTop:10,background:"#2e1a1a",border:"1px solid #ff6b6b44",borderRadius:9,
+            padding:"9px 12px",fontSize:12,color:"#ff6b6b",display:"flex",alignItems:"center",gap:8}}>
+            <span style={{fontSize:16}}>⚠️</span><span>{importMsg}</span>
+          </div>
+        )}
+      </div>
+
+      <div style={{background:"#1a0f0f",borderRadius:14,padding:14,border:"1px solid #3a1a1a"}}>
+        <div style={{fontWeight:700,fontSize:14,marginBottom:4,color:"#ff6b6b"}}>⚠️ Reset dati</div>
+        <div style={{fontSize:12,color:"#666",marginBottom:10}}>Elimina alimenti, ricette, piani e calendario. Supermercati ripristinati ai default.</div>
+        <button onClick={resetAll} style={{width:"100%",background:"#ff6b6b22",color:"#ff6b6b",border:"1px solid #ff6b6b44",borderRadius:9,padding:10,fontWeight:700,fontSize:13,cursor:"pointer"}}>
+          Elimina tutti i dati
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── PLANS VIEW ───────────────────────────────────────────────────────────────
+function PlansView({mealPlans,setMealPlans,foods,recipes}){
+  const [view,setView]           =useState("list");
+  const [selectedPlan,setSelectedPlan]=useState(null);
+  const [form,setForm]           =useState({name:"",note:"",persona:"",fase:"",tipologia:"",slots:{}});
+  const [activeSlot,setActiveSlot]=useState("colazione");
+  const [activeSubSlot,setActiveSubSlot]=useState("comune"); // "comune"|"giusy"|"davide"
+  const [searchFood,setSearchFood]=useState("");
+  const [editingNote,setEditingNote]=useState(null); // {subSlot,foodId}
+
+  const getFoodOrRecipe=id=>foods.find(f=>f.id===id)||recipes.find(r=>r.id===id);
+
+  // Garantisce che uno slot abbia sempre il nuovo formato
+  const ensureSlot=slotId=>{
+    const s=form.slots[slotId];
+    if(!s) return{comune:[],giusy:[],davide:[]};
+    if(isNewSlotFormat(s)) return JSON.parse(JSON.stringify(s));
+    return{comune:Array.isArray(s)?[...s]:[],giusy:[],davide:[]};
+  };
+
+  const setGrams=(slotId,subSlot,foodId,grams)=>{
+    setForm(f=>{
+      const slot=ensureSlot(slotId);
+      slot[subSlot]=(slot[subSlot]||[]).map(i=>i.foodId===foodId?{...i,grams:+grams}:i);
+      return{...f,slots:{...f.slots,[slotId]:slot}};
+    });
+  };
+  const setGramsComune=(slotId,foodId,who,grams)=>{
+    // who: "giusy" → gramsG, "davide" → gramsD
+    const field=who==="giusy"?"gramsG":"gramsD";
+    setForm(f=>{
+      const slot=ensureSlot(slotId);
+      slot.comune=(slot.comune||[]).map(i=>i.foodId===foodId?{...i,[field]:+grams}:i);
+      return{...f,slots:{...f.slots,[slotId]:slot}};
+    });
+  };
+  const setIngNote=(slotId,subSlot,foodId,note)=>{
+    setForm(f=>{
+      const slot=ensureSlot(slotId);
+      slot[subSlot]=(slot[subSlot]||[]).map(i=>i.foodId===foodId?{...i,note}:i);
+      return{...f,slots:{...f.slots,[slotId]:slot}};
+    });
+  };
+  const addFoodToSlot=(slotId,subSlot,foodId)=>{
+    setForm(f=>{
+      const slot=ensureSlot(slotId);
+      if((slot[subSlot]||[]).find(i=>i.foodId===foodId)) return f;
+      const newItem=subSlot==="comune"
+        ?{foodId,gramsG:100,gramsD:100,note:""}
+        :{foodId,grams:100,note:""};
+      slot[subSlot]=[...(slot[subSlot]||[]),newItem];
+      return{...f,slots:{...f.slots,[slotId]:slot}};
+    });
+    setSearchFood("");
+  };
+  const removeFoodFromSlot=(slotId,subSlot,foodId)=>{
+    setForm(f=>{
+      const slot=ensureSlot(slotId);
+      slot[subSlot]=(slot[subSlot]||[]).filter(i=>i.foodId!==foodId);
+      return{...f,slots:{...f.slots,[slotId]:slot}};
+    });
+  };
+
+  // Conta totale ingredienti in uno slot (tutti i sotto-slot)
+  const slotTotalCount=slotId=>{
+    const s=form.slots[slotId];if(!s) return 0;
+    if(isNewSlotFormat(s)) return (s.comune||[]).length+(s.giusy||[]).length+(s.davide||[]).length;
+    return Array.isArray(s)?s.length:0;
+  };
+
+  const currentSlotData=isNewSlotFormat(form.slots[activeSlot])
+    ?form.slots[activeSlot]
+    :{comune:Array.isArray(form.slots[activeSlot])?form.slots[activeSlot]:[],giusy:[],davide:[]};
+  const currentSlotItems=currentSlotData[activeSubSlot]||[];
+
+  const savePlan=()=>{
+    if(!form.name.trim()) return;
+    const plan={
+      id:selectedPlan?.id||`p${Date.now()}`,
+      name:form.name.trim(), note:form.note.trim(),
+      persona:form.persona, fase:form.fase, tipologia:form.tipologia,
+      slots:form.slots
+    };
+    if(selectedPlan) setMealPlans(p=>p.map(x=>x.id===selectedPlan.id?plan:x));
+    else             setMealPlans(p=>[...p,plan]);
+    setView("list");setSelectedPlan(null);setForm({name:"",note:"",persona:"",fase:"",tipologia:"",slots:{}});
+  };
+  const deletePlan=id=>{
+    if(!window.confirm("Eliminare il piano?")) return;
+    setMealPlans(p=>p.filter(x=>x.id!==id));
+    setView("list");setSelectedPlan(null);
+  };
+  const duplicatePlan=plan=>{
+    const copy={...JSON.parse(JSON.stringify(plan)),id:`p${Date.now()}`,name:`${plan.name} (copia)`};
+    setMealPlans(p=>[...p,copy]);
+  };
+  const startNew=()=>{
+    setSelectedPlan(null);
+    setForm({name:"",note:"",persona:"",fase:"",tipologia:"",slots:{}});
+    setActiveSlot("colazione");setActiveSubSlot("comune");setSearchFood("");setEditingNote(null);setView("edit");
+  };
+  const startEdit=plan=>{
+    setSelectedPlan(plan);
+    setForm({
+      name:plan.name, note:plan.note||"",
+      persona:plan.persona||"", fase:plan.fase||"", tipologia:plan.tipologia||"",
+      slots:JSON.parse(JSON.stringify(plan.slots||{}))
+    });
+    setActiveSlot("colazione");setActiveSubSlot("comune");setSearchFood("");setEditingNote(null);setView("edit");
+  };
+  const openDetail=plan=>{setSelectedPlan(plan);setView("detail");};
+
+  const calcPlanTotals=plan=>{
+    let kc=0,pt=0,gr=0,ca=0;
+    Object.values(plan.slots||{}).forEach(slot=>{
+      if(isNewSlotFormat(slot)){
+        (slot.comune||[]).forEach(item=>{
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const gG=item.gramsG??item.grams??0;
+          const gD=item.gramsD??item.grams??0;
+          const mG=macrosFromGrams(f,gG);const mD=macrosFromGrams(f,gD);
+          kc+=mG.kcal+mD.kcal;pt+=mG.p+mD.p;gr+=mG.g+mD.g;ca+=mG.c+mD.c;
+        });
+        (slot.giusy||[]).forEach(item=>{
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+        (slot.davide||[]).forEach(item=>{
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+      } else {
+        (Array.isArray(slot)?slot:[]).forEach(item=>{
+          const f=getFoodOrRecipe(item.foodId);if(!f) return;
+          const m=macrosFromGrams(f,item.grams??0);kc+=m.kcal;pt+=m.p;gr+=m.g;ca+=m.c;
+        });
+      }
+    });
+    return{kcal:Math.round(kc),p:Math.round(pt*10)/10,g:Math.round(gr*10)/10,c:Math.round(ca*10)/10};
+  };
+
+  const allFoodsAndRecipes=[...foods,...recipes];
+  const filteredSearch=allFoodsAndRecipes.filter(f=>f.name.toLowerCase().includes(searchFood.toLowerCase()));
+
+  const filteredPlans=mealPlans;
+
+  // Badge persona/fase/tipo
+  // ── DETAIL VIEW ──
+  if(view==="detail"&&selectedPlan){
+    const tot=calcPlanTotals(selectedPlan);
+    return(
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+          <button onClick={()=>setView("list")} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:8,padding:"6px 11px",fontSize:12,cursor:"pointer"}}>← Lista</button>
+          <div style={{flex:1,fontWeight:700,fontSize:15,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{selectedPlan.name}</div>
+          <button onClick={()=>startEdit(selectedPlan)} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:8,padding:"6px 11px",fontSize:12,cursor:"pointer"}}>✏️</button>
+        </div>
+
+        {/* Totali */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:6,marginBottom:14,marginTop:10}}>
+          {[["kcal",tot.kcal,""],["P",tot.p,"g"],["G",tot.g,"g"],["C",tot.c,"g"]].map(([lbl,val,unit])=>(
+            <div key={lbl} style={{background:"#161616",borderRadius:10,padding:"10px 6px",textAlign:"center",border:"1px solid #1e1e1e"}}>
+              <div style={{fontSize:15,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace"}}>{val}{unit}</div>
+              <div style={{fontSize:9,color:"#444",marginTop:2}}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Slot */}
+        {SLOTS.map(slot=>{
+          const slotData=selectedPlan.slots[slot.id];
+          if(!slotData) return null;
+          const sections=isNewSlotFormat(slotData)
+            ?[{label:null,items:slotData.comune||[],isComune:true},{label:"Giusy",items:slotData.giusy||[],isComune:false},{label:"Davide",items:slotData.davide||[],isComune:false}]
+            :[{label:null,items:Array.isArray(slotData)?slotData:[],isComune:false}];
+          const hasAny=sections.some(s=>s.items.length>0);
+          if(!hasAny) return null;
+          let slotKc=0;
+          sections.forEach(s=>s.items.forEach(item=>{
+            const f=getFoodOrRecipe(item.foodId);if(!f) return;
+            if(s.isComune){
+              slotKc+=macrosFromGrams(f,item.gramsG??item.grams??0).kcal;
+              slotKc+=macrosFromGrams(f,item.gramsD??item.grams??0).kcal;
+            } else {
+              slotKc+=macrosFromGrams(f,item.grams??0).kcal;
+            }
+          }));
+          return(
+            <div key={slot.id} style={{background:"#161616",borderRadius:13,marginBottom:10,border:"1px solid #1e1e1e",overflow:"hidden"}}>
+              <div style={{padding:"10px 13px",borderBottom:"1px solid #1e1e1e",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+                <div style={{display:"flex",alignItems:"center",gap:7}}>
+                  <span style={{fontSize:15}}>{slot.icon}</span>
+                  <span style={{fontWeight:600,fontSize:13}}>{slot.label}</span>
+                </div>
+                <span style={{fontSize:10,color:"#555",fontFamily:"'DM Mono',monospace"}}>{Math.round(slotKc)} kcal</span>
+              </div>
+              <div style={{padding:"8px 10px"}}>
+                {sections.map(({label:sLabel,items,isComune})=>{
+                  if(!items.length) return null;
+                  const sColor=sLabel==="Giusy"?"#a8e6cf":sLabel==="Davide"?"#82b4ff":null;
+                  return(
+                    <div key={sLabel||"comune"}>
+                      {sLabel&&<div style={{fontSize:9,color:sColor,fontWeight:700,letterSpacing:1,textTransform:"uppercase",marginBottom:4,marginTop:4,paddingLeft:2}}>{sLabel}</div>}
+                      {items.map(item=>{
+                        const f=getFoodOrRecipe(item.foodId);if(!f) return null;
+                        if(isComune){
+                          const gG=item.gramsG??item.grams??0;
+                          const gD=item.gramsD??item.grams??0;
+                          const samePortion=gG===gD;
+                          const mG=macrosFromGrams(f,gG);
+                          return(
+                            <div key={item.foodId} style={{background:"#0f0f0f",borderRadius:9,padding:"8px 11px",marginBottom:5}}>
+                              <div style={{display:"flex",alignItems:"center",gap:9}}>
+                                <div style={{flex:1}}>
+                                  <div style={{fontSize:13,fontWeight:600}}>{f.name}</div>
+                                  <div style={{fontSize:9,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:2}}>{mG.kcal} kcal · P{mG.p} G{mG.g} C{mG.c}</div>
+                                </div>
+                                {samePortion
+                                  ?<div style={{fontSize:16,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{gG}g</div>
+                                  :<div style={{display:"flex",gap:6,flexShrink:0,alignItems:"center"}}>
+                                    <span style={{fontSize:8,fontWeight:700,color:"#a8e6cf",background:"#a8e6cf22",borderRadius:3,padding:"1px 4px"}}>G</span>
+                                    <span style={{fontSize:14,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace"}}>{gG}g</span>
+                                    <span style={{fontSize:8,fontWeight:700,color:"#82b4ff",background:"#82b4ff22",borderRadius:3,padding:"1px 4px"}}>D</span>
+                                    <span style={{fontSize:14,fontWeight:700,color:"#82b4ff",fontFamily:"'DM Mono',monospace"}}>{gD}g</span>
+                                  </div>
+                                }
+                              </div>
+                              {item.note&&<div style={{fontSize:10,color:"#666",marginTop:5,fontStyle:"italic",paddingLeft:2}}>📝 {item.note}</div>}
+                            </div>
+                          );
+                        }
+                        const m=macrosFromGrams(f,item.grams??0);
+                        return(
+                          <div key={item.foodId} style={{background:"#0f0f0f",borderRadius:9,padding:"8px 11px",marginBottom:5}}>
+                            <div style={{display:"flex",alignItems:"center",gap:9}}>
+                              <div style={{flex:1}}>
+                                <div style={{fontSize:13,fontWeight:600}}>{f.name}</div>
+                                <div style={{fontSize:9,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:2}}>{m.kcal} kcal · P{m.p} G{m.g} C{m.c}</div>
+                              </div>
+                              <div style={{fontSize:16,fontWeight:700,color:sColor||"#a8e6cf",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{item.grams??0}g</div>
+                            </div>
+                            {item.note&&<div style={{fontSize:10,color:"#666",marginTop:5,fontStyle:"italic",paddingLeft:2}}>📝 {item.note}</div>}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          );
+        })}
+
+        <div style={{display:"flex",gap:7,marginTop:4}}>
+          <button onClick={()=>duplicatePlan(selectedPlan)}
+            style={{flex:1,background:"#252525",color:"#bbb",border:"1px solid #2a2a2a",borderRadius:10,padding:10,fontWeight:600,fontSize:12,cursor:"pointer"}}>
+            📋 Duplica
+          </button>
+          <button onClick={()=>deletePlan(selectedPlan.id)}
+            style={{flex:1,background:"#ff6b6b22",color:"#ff6b6b",border:"1px solid #ff6b6b44",borderRadius:10,padding:10,fontWeight:700,fontSize:12,cursor:"pointer"}}>
+            🗑️ Elimina
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ── EDIT / NEW VIEW ──
+  if(view==="edit"){
+    return(
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:14}}>
+          <button onClick={()=>{setView(selectedPlan?"detail":"list");}} style={{background:"#252525",border:"none",color:"#a8e6cf",borderRadius:8,padding:"6px 11px",fontSize:12,cursor:"pointer"}}>← Annulla</button>
+          <div style={{flex:1,fontWeight:700,fontSize:15}}>{selectedPlan?"Modifica piano":"Nuovo piano"}</div>
+          <button onClick={savePlan} disabled={!form.name.trim()}
+            style={{background:form.name.trim()?"#a8e6cf":"#252525",color:form.name.trim()?"#0f0f0f":"#555",border:"none",borderRadius:8,padding:"6px 14px",fontSize:12,fontWeight:700,cursor:"pointer"}}>
+            Salva
+          </button>
+        </div>
+
+        {/* Nome e classificazione */}
+        <div style={{background:"#161616",borderRadius:13,padding:13,marginBottom:12,border:"1px solid #1e1e1e"}}>
+          <label style={{fontSize:11,color:"#666",display:"block",marginBottom:3}}>Nome piano</label>
+          <input value={form.name} onChange={e=>setForm(f=>({...f,name:e.target.value}))} placeholder="es. Definizione Giusy OFF"
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"8px 10px",fontSize:13,marginBottom:12}}/>
+
+
+        </div>
+
+        {/* Slot selector */}
+        <div style={{display:"flex",gap:4,overflowX:"auto",paddingBottom:4,marginBottom:8}}>
+          {SLOTS.map(slot=>{
+            const count=slotTotalCount(slot.id);
+            return(
+              <button key={slot.id} onClick={()=>{setActiveSlot(slot.id);setActiveSubSlot("comune");setEditingNote(null);}} className="tap"
+                style={{flexShrink:0,padding:"6px 10px",borderRadius:9,border:"none",fontSize:11,fontWeight:600,cursor:"pointer",
+                  background:activeSlot===slot.id?"#a8e6cf":"#161616",color:activeSlot===slot.id?"#0f0f0f":"#555",
+                  display:"flex",alignItems:"center",gap:4}}>
+                <span>{slot.icon}</span>
+                <span>{slot.label.split(" ")[0]}</span>
+                {count>0&&<span style={{background:activeSlot===slot.id?"#0f0f0f33":"#a8e6cf33",color:activeSlot===slot.id?"#0f0f0f":"#a8e6cf",borderRadius:10,padding:"0 5px",fontSize:10,fontWeight:700}}>{count}</span>}
+              </button>
+            );
+          })}
+        </div>
+        {/* Sub-slot selector: Comune / Giusy / Davide */}
+        <div style={{display:"flex",gap:5,marginBottom:10}}>
+          {[["comune","Comune","#a8e6cf"],["giusy","Giusy","#a8e6cf"],["davide","Davide","#82b4ff"]].map(([id,lbl,col])=>{
+            const cnt=(currentSlotData[id]||[]).length;
+            const isActive=activeSubSlot===id;
+            return(
+              <button key={id} onClick={()=>{setActiveSubSlot(id);setEditingNote(null);}} className="tap"
+                style={{flex:1,padding:"6px 4px",borderRadius:8,border:`1px solid ${isActive?col+"66":"#252525"}`,
+                  fontSize:11,fontWeight:600,cursor:"pointer",
+                  background:isActive?col+"22":"#0f0f0f",color:isActive?col:"#555",
+                  display:"flex",alignItems:"center",justifyContent:"center",gap:4}}>
+                <span>{lbl}</span>
+                {cnt>0&&<span style={{background:isActive?col+"33":"#252525",color:isActive?col:"#555",borderRadius:8,padding:"0 5px",fontSize:9,fontWeight:700}}>{cnt}</span>}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Alimenti nello slot attivo */}
+        <div style={{background:"#161616",borderRadius:13,padding:11,marginBottom:10,border:"1px solid #1e1e1e",minHeight:60}}>
+          {currentSlotItems.length===0
+            ?<div style={{color:"#333",fontSize:11,fontStyle:"italic",textAlign:"center",padding:"8px 0"}}>Nessun alimento in questo slot</div>
+            :currentSlotItems.map((item)=>{
+              const {foodId,note}=item;
+              const f=getFoodOrRecipe(foodId);if(!f) return null;
+              const isEditingThisNote=editingNote?.subSlot===activeSubSlot&&editingNote?.foodId===foodId;
+              const isComune=activeSubSlot==="comune";
+              const gG=item.gramsG??item.grams??100;
+              const gD=item.gramsD??item.grams??100;
+              const grams=item.grams??100;
+              const displayGrams=isComune?gG:grams; // per il calcolo macro preview
+              const m=macrosFromGrams(f,displayGrams);
+              return(
+                <div key={foodId} style={{background:"#0f0f0f",borderRadius:9,padding:"8px 10px",marginBottom:6}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8}}>
+                    <div style={{flex:1}}>
+                      <div style={{fontSize:12,fontWeight:600}}>{f.name}</div>
+                      <div style={{fontSize:9,color:"#444",fontFamily:"'DM Mono',monospace",marginTop:1}}>{m.kcal} kcal · P{m.p} G{m.g} C{m.c}</div>
+                    </div>
+                    {isComune
+                      ?<div style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+                        <span style={{fontSize:8,fontWeight:700,color:"#a8e6cf",background:"#a8e6cf22",borderRadius:3,padding:"1px 4px"}}>G</span>
+                        <input type="number" value={gG} min={1}
+                          onChange={e=>setGramsComune(activeSlot,foodId,"giusy",e.target.value)}
+                          style={{width:46,background:"#1a1a1a",border:"1px solid #2a2a2a",color:"#a8e6cf",borderRadius:6,padding:"4px 4px",fontSize:12,textAlign:"center",fontWeight:700,fontFamily:"'DM Mono',monospace"}}/>
+                        <span style={{fontSize:8,fontWeight:700,color:"#82b4ff",background:"#82b4ff22",borderRadius:3,padding:"1px 4px",marginLeft:2}}>D</span>
+                        <input type="number" value={gD} min={1}
+                          onChange={e=>setGramsComune(activeSlot,foodId,"davide",e.target.value)}
+                          style={{width:46,background:"#1a1a1a",border:"1px solid #2a2a2a",color:"#82b4ff",borderRadius:6,padding:"4px 4px",fontSize:12,textAlign:"center",fontWeight:700,fontFamily:"'DM Mono',monospace"}}/>
+                        <span style={{fontSize:10,color:"#444"}}>g</span>
+                      </div>
+                      :<div style={{display:"flex",alignItems:"center",gap:4,flexShrink:0}}>
+                        <input type="number" value={grams} min={1}
+                          onChange={e=>setGrams(activeSlot,activeSubSlot,foodId,e.target.value)}
+                          style={{width:56,background:"#1a1a1a",border:"1px solid #2a2a2a",color:activeSubSlot==="davide"?"#82b4ff":"#a8e6cf",borderRadius:6,padding:"4px 5px",fontSize:13,textAlign:"center",fontWeight:700,fontFamily:"'DM Mono',monospace"}}/>
+                        <span style={{fontSize:10,color:"#444"}}>g</span>
+                      </div>
+                    }
+                    <button onClick={()=>setEditingNote(isEditingThisNote?null:{subSlot:activeSubSlot,foodId})}
+                      style={{background:"none",border:"none",color:note||isEditingThisNote?(isComune?"#a8e6cf":activeSubSlot==="davide"?"#82b4ff":"#a8e6cf"):"#2a2a2a",fontSize:14,padding:0,cursor:"pointer"}}>📝</button>
+                    <button onClick={()=>removeFoodFromSlot(activeSlot,activeSubSlot,foodId)}
+                      style={{background:"none",border:"none",color:"#3a3a3a",fontSize:18,lineHeight:1,padding:0,cursor:"pointer"}}>×</button>
+                  </div>
+                  {isEditingThisNote&&(
+                    <input
+                      autoFocus
+                      value={note||""}
+                      onChange={e=>setIngNote(activeSlot,activeSubSlot,foodId,e.target.value)}
+                      placeholder="Nota ingrediente (es. cotto, senza sale...)"
+                      style={{width:"100%",background:"#1a1a1a",border:"1px solid #a8e6cf44",color:"#ccc",borderRadius:6,
+                        padding:"5px 8px",fontSize:11,marginTop:7,fontStyle:"italic"}}
+                    />
+                  )}
+                  {!isEditingThisNote&&note&&(
+                    <div style={{fontSize:10,color:"#666",marginTop:5,fontStyle:"italic",paddingLeft:2}}>📝 {note}</div>
+                  )}
+                </div>
+              );
+            })
+          }
+        </div>
+
+        {/* Ricerca alimento */}
+        <div style={{background:"#161616",borderRadius:13,padding:11,border:"1px solid #1e1e1e"}}>
+          <div style={{fontSize:11,color:"#666",marginBottom:7}}>Aggiungi a {SLOTS.find(s=>s.id===activeSlot)?.label} ({activeSubSlot==='comune'?'Comune':activeSubSlot==='giusy'?'Giusy':'Davide'})</div>
+          <input placeholder="Cerca nella libreria..." value={searchFood} onChange={e=>setSearchFood(e.target.value)}
+            style={{width:"100%",background:"#0f0f0f",border:"1px solid #2a2a2a",color:"#fff",borderRadius:7,padding:"7px 10px",fontSize:12,marginBottom:6}}/>
+          {searchFood&&(
+            <div style={{maxHeight:180,overflowY:"auto"}}>
+              {filteredSearch.slice(0,8).map(f=>{
+                const already=currentSlotItems.some(i=>i.foodId===f.id);
+                return(
+                  <div key={f.id} onClick={()=>!already&&addFoodToSlot(activeSlot,activeSubSlot,f.id)}
+                    style={{padding:"8px 10px",cursor:already?"default":"pointer",borderBottom:"1px solid #0f0f0f",fontSize:12,
+                      color:already?"#333":"#ccc",display:"flex",justifyContent:"space-between",alignItems:"center",
+                      background:already?"#0a0a0a":"transparent",borderRadius:7,marginBottom:2}}>
+                    <span>{f.name}</span>
+                    <div style={{display:"flex",alignItems:"center",gap:6}}>
+                      <span style={{color:"#444",fontFamily:"'DM Mono',monospace",fontSize:10}}>{f.kcal}kc</span>
+                      {already?<span style={{fontSize:10,color:"#555"}}>già aggiunto</span>:<span style={{color:"#a8e6cf",fontSize:16}}>+</span>}
+                    </div>
+                  </div>
+                );
+              })}
+              {filteredSearch.length===0&&<div style={{padding:"8px 10px",fontSize:12,color:"#444"}}>Nessun risultato</div>}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── LIST VIEW ──
+  return(
+    <div>
+      {/* Header + pulsante nuovo */}
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}>
+        <button onClick={startNew}
+          style={{background:"#a8e6cf",color:"#0f0f0f",border:"none",borderRadius:9,padding:"8px 18px",fontWeight:700,fontSize:13,cursor:"pointer"}}>
+          + Nuovo piano
+        </button>
+      </div>
+
+      {/* Lista */}
+      {filteredPlans.length===0&&(
+        <div style={{textAlign:"center",color:"#333",padding:"48px 0",fontSize:13}}>
+          <div style={{fontSize:42,marginBottom:10}}>📋</div>
+          {mealPlans.length===0
+            ?<><div>Nessun piano ancora.</div><div style={{marginTop:4,color:"#2a2a2a"}}>Creane uno con il pulsante qui sopra.</div></>
+            :<div>Nessun piano corrisponde ai filtri selezionati.</div>
+          }
+        </div>
+      )}
+      {filteredPlans.map(plan=>{
+        const tot=calcPlanTotals(plan);
+        const nSlots=Object.values(plan.slots||{}).filter(s=>s.length>0).length;
+        const nFoods=Object.values(plan.slots||{}).reduce((a,s)=>a+s.length,0);
+        return(
+          <div key={plan.id} onClick={()=>openDetail(plan)} className="tap"
+            style={{background:"#161616",borderRadius:13,padding:"13px 14px",marginBottom:9,border:"1px solid #1e1e1e",cursor:"pointer"}}>
+            <div style={{display:"flex",alignItems:"flex-start",justifyContent:"space-between",marginBottom:4}}>
+              <div style={{fontWeight:700,fontSize:14,flex:1,marginRight:8}}>{plan.name}</div>
+              <span style={{fontSize:10,color:"#555",fontFamily:"'DM Mono',monospace",flexShrink:0}}>{nSlots}p·{nFoods}a</span>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:5,marginTop:8}}>
+              {[["kcal",tot.kcal,""],["P",tot.p,"g"],["G",tot.g,"g"],["C",tot.c,"g"]].map(([lbl,val,unit])=>(
+                <div key={lbl} style={{background:"#0f0f0f",borderRadius:8,padding:"7px 5px",textAlign:"center"}}>
+                  <div style={{fontSize:13,fontWeight:700,color:"#a8e6cf",fontFamily:"'DM Mono',monospace"}}>{val}{unit}</div>
+                  <div style={{fontSize:8,color:"#444",marginTop:1}}>{lbl}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── MOUNT ────────────────────────────────────────────────────────────────────
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(React.createElement(NutritionApp));
+</script>
+
+<!-- ═══ SERVICE WORKER ════════════════════════════════════════════════════════ -->
+<script>
+if ('serviceWorker' in navigator) {
+  const swCode = `
+    const CACHE = 'nutrition-hub-v1';
+    self.addEventListener('install', e => {
+      e.waitUntil(
+        caches.open(CACHE).then(cache => {
+          return Promise.allSettled([
+            'https://fonts.googleapis.com/css2?family=Sora:wght@300;400;600;700&family=DM+Mono:wght@400;500&display=swap',
+            'https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js',
+            'https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js',
+            'https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js',
+          ].map(url => cache.add(url).catch(() => {})));
+        }).then(() => self.skipWaiting())
+      );
+    });
+    self.addEventListener('activate', e => {
+      e.waitUntil(
+        caches.keys().then(keys =>
+          Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k)))
+        ).then(() => self.clients.claim())
+      );
+    });
+    self.addEventListener('fetch', e => {
+      const isCDN = e.request.url.includes('cdnjs') || e.request.url.includes('fonts.google');
+      if (isCDN) {
+        e.respondWith(
+          caches.match(e.request).then(cached => cached || fetch(e.request).then(res => {
+            const clone = res.clone();
+            caches.open(CACHE).then(c => c.put(e.request, clone));
+            return res;
+          }))
+        );
+      } else {
+        e.respondWith(
+          fetch(e.request).then(res => {
+            const clone = res.clone();
+            caches.open(CACHE).then(c => c.put(e.request, clone));
+            return res;
+          }).catch(() => caches.match(e.request))
+        );
+      }
+    });
+  `;
+  const blob = new Blob([swCode], { type: 'application/javascript' });
+  const swURL = URL.createObjectURL(blob);
+  navigator.serviceWorker.register(swURL, { scope: '/' })
+    .then(() => console.log('Nutrition Hub: offline ready ✓'))
+    .catch(e => console.log('SW skipped:', e.message));
+}
+</script>
+</body>
+</html>
